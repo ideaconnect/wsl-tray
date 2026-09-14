@@ -76,7 +76,7 @@ The only dependency is [`windows-sys`](https://crates.io/crates/windows-sys),
 which contains nothing but `extern` declarations. There is no runtime, no COM,
 no allocation on the poll path beyond reusing one buffer.
 
-For comparison, the [original Go version](https://github.com/ideaconnect/wsl-tray/tree/main/legacy)
+For comparison, the [original Go version](https://github.com/ideaconnect/wsl-tray/tree/80832856e8e4c4db82938dd60d8245e506c6db0a/legacy/go)
 of this program was a 2.4 MB executable using 16 MB of private memory and 8
 threads; the difference is the Go runtime.
 
