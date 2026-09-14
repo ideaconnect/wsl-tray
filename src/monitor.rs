@@ -1,7 +1,36 @@
-//! Samples the WSL2 utility-VM process ("vmmemWSL") through
-//! `NtQuerySystemInformation(SystemProcessInformation)`. That call needs no
-//! process handle, so it works for a standard (non-elevated) user even though
-//! vmmemWSL runs as SYSTEM (`OpenProcess` on it is denied).
+//! Finds the WSL2 utility VM and measures it.
+//!
+//! # Why the process list, and why this API
+//!
+//! WSL2 runs all distributions inside one lightweight Hyper-V VM whose memory
+//! and CPU time Windows accounts to a placeholder process, `vmmemWSL`
+//! (`vmmem` on older Windows 10 builds). Its existence is the most reliable
+//! "is WSL2 on" signal: `wsl --list --running` reports no running
+//! distributions while the VM is still alive and holding memory (the VM
+//! lingers for `vmIdleTimeout` after the last distribution exits).
+//!
+//! The VM process runs as SYSTEM, so `OpenProcess` on it fails for a normal
+//! user and `GetProcessTimes` / `GetProcessMemoryInfo` are out.
+//! `NtQuerySystemInformation(SystemProcessInformation)` returns the same
+//! numbers for every process without opening anything, which is how Task
+//! Manager does it too. It is an undocumented-but-stable ntdll export; the
+//! function is resolved with `GetProcAddress` so no import library is needed.
+//!
+//! # What the numbers mean
+//!
+//! * CPU: the increase of the process's kernel+user time between two
+//!   samples, divided by the wall-clock time between them and by the number
+//!   of logical cores, in percent. 100 % means every core of the host was busy
+//!   with WSL2. It is `None` until a second sample exists.
+//! * Memory: the process working set, which for the VM is the memory the VM
+//!   has actually touched; this is the "Memory" column Task Manager shows for
+//!   `vmmemWSL`. Also given as a percentage of physical RAM.
+//!
+//! # Cost
+//!
+//! One snapshot copies every process entry (about 700 KB for 250 processes,
+//! ~4 ms). It is taken every `-poll` seconds; the CPU/memory numbers are only
+//! recomputed every `-interval` seconds so the tooltip does not flicker.
 
 use std::ffi::c_void;
 use std::ptr::null;
@@ -20,10 +49,13 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::wide;
 
-/// What the UI shows.
+/// One observation of the VM, as shown by the UI.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Status {
+    /// The VM process exists.
     pub running: bool,
+    /// Process id of the VM (0 when not running). A changed pid means the VM
+    /// was restarted, which resets the CPU baseline.
     pub pid: usize,
     /// Percent of all host logical cores; `None` = not measured yet.
     pub cpu: Option<f64>,
@@ -35,26 +67,46 @@ pub struct Status {
     pub updated: Option<(u16, u16, u16)>,
 }
 
+/// Stateful sampler: remembers the previous CPU reading so the next one can
+/// be turned into a rate, and reuses one buffer for the process snapshot.
 pub struct Monitor {
-    proc_name: String, // lower-cased (Unicode, like Go's strings.ToLower)
+    /// Image name to look for, lower-cased with full Unicode rules.
+    proc_name: String,
+    /// Minimum time between CPU/memory refreshes while the VM runs.
     stats_every: Duration,
+    /// Logical cores of the host, the denominator of the CPU percentage.
     ncpu: f64,
+    /// Physical RAM in bytes, the denominator of the memory percentage.
     total_mem: f64,
 
+    /// Last published status.
     cur: Status,
-    last_t: Instant, // when the CPU baseline was taken
-    last_cpu: i64,   // kernel+user time (100 ns units) at last_t
+    /// When `last_cpu` was read (the CPU baseline).
+    last_t: Instant,
+    /// Kernel+user time of the VM at `last_t`, in 100 ns units.
+    last_cpu: i64,
+    /// Pid the baseline belongs to; a different pid invalidates it.
     last_pid: usize,
+    /// Snapshot buffer, grown on demand and kept between polls.
     buf: Vec<u8>,
+    /// `ntdll!NtQuerySystemInformation`, or `None` if it could not be found
+    /// (then the VM is reported as not running).
     nt_query: Option<NtQuerySystemInformationFn>,
 }
 
+/// `NTSTATUS NtQuerySystemInformation(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG)`.
 type NtQuerySystemInformationFn = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
 
+/// `SystemProcessInformation` member of `SYSTEM_INFORMATION_CLASS`.
 const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+/// Returned when the buffer is too small; `needed` then holds the size.
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004_u32 as i32;
 
-/// SYSTEM_PROCESS_INFORMATION (x64 layout). Only the leading fields are needed.
+/// Leading part of `SYSTEM_PROCESS_INFORMATION` (x64 layout, from the Windows
+/// SDK's `winternl.h` plus the documented "reserved" fields). Entries are
+/// chained by `next_entry_offset`; each is followed by its thread array and
+/// the image-name string, which is why only the prefix is declared and
+/// entries are read with `read_unaligned` at their offsets.
 #[repr(C)]
 struct SysProcInfo {
     next_entry_offset: u32,
@@ -86,6 +138,8 @@ struct SysProcInfo {
 }
 
 impl Monitor {
+    /// Creates a sampler for the process called `proc_name`. Captures the
+    /// host's core count and RAM once; both are constant for the session.
     pub fn new(proc_name: &str, stats_every: Duration) -> Self {
         let nt_query = unsafe {
             let ntdll = GetModuleHandleW(wide("ntdll.dll").as_ptr());
@@ -106,13 +160,24 @@ impl Monitor {
         }
     }
 
+    /// The status published by the last [`poll`](Self::poll).
     pub fn current(&self) -> Status {
         self.cur
     }
 
-    /// Checks whether the VM process exists (cheap) and, when it does and the
-    /// stats interval has elapsed (or `force` is set), refreshes CPU/memory.
-    /// Returns the status and whether anything visible changed.
+    /// Takes a process snapshot and updates the status.
+    ///
+    /// Returns the status and whether anything visible changed, so the caller
+    /// can skip redrawing. The state machine:
+    ///
+    /// * VM not found: report stopped (changed only if it was running).
+    /// * VM newly found, or a different pid than last time: publish memory
+    ///   immediately, remember the CPU time as a baseline, CPU stays `None`.
+    /// * VM known: recompute CPU and memory when `force` is set, when
+    ///   `stats_every` has elapsed since the baseline, or when there is no
+    ///   CPU reading yet (so the first number appears one poll after the VM
+    ///   showed up rather than a full interval later). A window shorter than
+    ///   one second is too noisy and is skipped.
     pub fn poll(&mut self, force: bool) -> (Status, bool) {
         let now = Instant::now();
         let found = self.find();
@@ -164,6 +229,7 @@ impl Monitor {
         (self.cur, true)
     }
 
+    /// `bytes` as a percentage of physical RAM (0 if RAM could not be read).
     fn mem_pct(&self, bytes: u64) -> f64 {
         if self.total_mem <= 0.0 {
             return 0.0;
@@ -171,8 +237,10 @@ impl Monitor {
         bytes as f64 / self.total_mem * 100.0
     }
 
-    /// Walks the process list and returns (pid, kernel+user time, working set)
-    /// of the first entry whose image name matches (case-insensitive).
+    /// Takes a `SystemProcessInformation` snapshot into `self.buf` (growing
+    /// it if `STATUS_INFO_LENGTH_MISMATCH` says so) and walks the entries.
+    /// Returns `(pid, kernel+user time in 100 ns units, working set bytes)`
+    /// of the first process whose image name matches, case-insensitively.
     fn find(&mut self) -> Option<(usize, i64, u64)> {
         let query = self.nt_query?;
         loop {
@@ -225,8 +293,9 @@ impl Monitor {
     }
 }
 
-/// Compares a UTF-16 name against a pre-lowercased one, lowering every
-/// character (not just A-Z) the way Go's `strings.ToLower` does.
+/// Compares a UTF-16 image name against a pre-lowercased `&str`, lowering
+/// every character (not just A-Z) the way Go's `strings.ToLower` does, and
+/// without allocating per process.
 fn eq_lowercase_utf16(name: &[u16], lower: &str) -> bool {
     char::decode_utf16(name.iter().copied())
         .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
@@ -234,12 +303,14 @@ fn eq_lowercase_utf16(name: &[u16], lower: &str) -> bool {
         .eq(lower.chars())
 }
 
+/// Logical processor count from `GetSystemInfo` (at least 1).
 fn num_cpus() -> u32 {
     let mut si: SYSTEM_INFO = unsafe { std::mem::zeroed() };
     unsafe { GetSystemInfo(&mut si) };
     si.dwNumberOfProcessors.max(1)
 }
 
+/// Physical RAM in bytes from `GlobalMemoryStatusEx`, or 0 on failure.
 fn total_phys_mem() -> u64 {
     let mut ms: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     ms.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
@@ -249,17 +320,24 @@ fn total_phys_mem() -> u64 {
     ms.ullTotalPhys
 }
 
+/// Local (hour, minute, second) for the "updated" line of the tooltip.
 fn local_time() -> (u16, u16, u16) {
     let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { GetLocalTime(&mut t) };
     (t.wHour, t.wMinute, t.wSecond)
 }
 
-/// Runs `wsl.exe --shutdown` with no console window and waits for it.
-/// Direct CreateProcessW instead of std::process::Command: that pulls in
-/// ~67 KB of pipe/environment code for a call whose output is not needed.
-/// The exe is named explicitly (System32) so, unlike a bare command line,
-/// the working directory is never searched for a `wsl.exe`.
+/// Runs `wsl.exe --shutdown` with no console window, waits for it, and
+/// fails with the exit code if it is non-zero.
+///
+/// Uses `CreateProcessW` directly instead of `std::process::Command`: the
+/// latter pulls in about 67 KB of pipe and environment handling for a call
+/// whose output is not needed. The executable is given by full path
+/// (`%SystemRoot%\System32\wsl.exe`) so that, unlike a bare command line,
+/// the current directory is never searched for a `wsl.exe`.
+///
+/// This is called from a helper thread, not the UI thread, because it blocks
+/// for as long as the shutdown takes (a few seconds).
 pub fn shutdown_wsl() -> Result<(), String> {
     let mut dir = [0u16; 260];
     let n = unsafe { GetSystemDirectoryW(dir.as_mut_ptr(), dir.len() as u32) } as usize;
@@ -306,6 +384,7 @@ pub fn shutdown_wsl() -> Result<(), String> {
     Ok(())
 }
 
+/// `768 MB` below 1 GiB, otherwise `5.40 GB` (binary units, two decimals).
 pub fn format_bytes(b: u64) -> String {
     const MB: u64 = 1 << 20;
     if b < 1024 * MB {

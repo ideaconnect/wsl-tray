@@ -1,6 +1,26 @@
-//! Tray icon: a Tux silhouette coloured by state, rendered from an embedded
-//! coverage mask (Font Awesome Free "linux" glyph, CC BY 4.0, pre-rasterized
-//! by tools/gentux-rs into assets/tux.bin) and scaled to the taskbar's icon size at runtime.
+//! The tray icon: a Tux silhouette coloured by state.
+//!
+//! # Pipeline
+//!
+//! 1. `tools/gentux-rs` rasterizes the Font Awesome "linux" glyph once, at
+//!    134 px, into two 8-bit planes: *coverage* (how much of each pixel the
+//!    glyph covers) and *holes* (pixels enclosed by the glyph: belly, face).
+//!    The result is `assets/tux.bin`, embedded here with `include_bytes!`.
+//! 2. At run time [`draw_icon`] shrinks both planes to the taskbar's icon
+//!    size with area averaging ([`resample`]), which gives clean antialiased
+//!    edges at 16–32 px, and paints them in the [`Level`] colour. The holes
+//!    are tinted at a lower alpha ([`HOLLOW_ALPHA`]) so the silhouette reads
+//!    as a solid shape on a dark taskbar instead of a thin outline.
+//! 3. [`render_icon`] puts the pixels in a 32-bpp DIB section and asks GDI
+//!    for an `HICON` via `CreateIconIndirect`.
+//!
+//! Pixels are BGRA, premultiplied: that is what a 32-bpp colour bitmap with
+//! an alpha channel means to `CreateIconIndirect`, and the shell composites
+//! it correctly on any taskbar colour. No font is involved anywhere, so the
+//! icon looks identical on every machine.
+//!
+//! [`encode_png`] and [`to_rgba`] exist for `-render-test`, which dumps every
+//! state and size as PNG so the artwork can be checked without a taskbar.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
@@ -13,17 +33,26 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICO
 
 use crate::monitor::Status;
 
-/// Load levels (the higher of CPU and memory share of the host):
-/// green < 50 %, orange 50-75 %, red > 75 %; gray = WSL2 is off.
+/// Colour of the icon, derived from a [`Status`].
+///
+/// While the VM runs, the level follows the higher of its CPU and memory
+/// share of the host: green below 50 %, orange from 50 % to 75 %, red above
+/// 75 %. Grey means the VM is off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
+    /// WSL2 is not running (grey).
     Off,
+    /// Running, load below 50 % (green).
     Ok,
+    /// Load between 50 % and 75 % (orange).
     Warn,
+    /// Load above 75 % (red).
     High,
 }
 
 impl Level {
+    /// Classifies a status. An unknown CPU reading (first sample after the
+    /// VM appeared) counts as 0 %, so memory alone decides until then.
     pub fn for_status(st: &Status) -> Level {
         if !st.running {
             return Level::Off;
@@ -38,6 +67,7 @@ impl Level {
         }
     }
 
+    /// Icon colour as R, G, B.
     fn rgb(self) -> [u8; 3] {
         match self {
             Level::Off => [150, 150, 150],
@@ -53,16 +83,22 @@ impl Level {
 const HOLLOW_ALPHA: u32 = 110;
 
 /// `assets/tux.bin`: u16 width, u16 height (little endian), then `w*h` bytes
-/// of glyph coverage followed by `w*h` bytes marking the enclosed holes.
+/// of glyph coverage followed by `w*h` bytes marking the enclosed holes
+/// (255 = hole, 0 = not a hole).
 static TUX: &[u8] = include_bytes!("../assets/tux.bin");
 
+/// The two planes of the embedded mask, `w*h` bytes each, row-major.
 struct Mask {
     w: usize,
     h: usize,
+    /// Glyph coverage, 0–255.
     cov: &'static [u8],
+    /// Enclosed transparent areas (belly, face), 0 or 255.
     holes: &'static [u8],
 }
 
+/// Parses the header of [`TUX`]. Panics only if the embedded file is
+/// malformed, which a unit test rules out.
 fn tux() -> Mask {
     let w = u16::from_le_bytes([TUX[0], TUX[1]]) as usize;
     let h = u16::from_le_bytes([TUX[2], TUX[3]]) as usize;
@@ -76,7 +112,9 @@ fn tux() -> Mask {
     }
 }
 
-/// Paints the icon into `pix` (BGRA premultiplied, `sz*sz` pixels).
+/// Paints the icon into `pix` (BGRA premultiplied, `sz*sz` pixels): the
+/// Tux glyph scaled to the full icon height, centred horizontally, in the
+/// level's colour. Pure CPU work, no GDI, so it is unit-testable.
 pub fn draw_icon(pix: &mut [u8], sz: usize, lv: Level) {
     pix.fill(0);
     let c = lv.rgb();
@@ -110,8 +148,11 @@ pub fn draw_icon(pix: &mut [u8], sz: usize, lv: Level) {
     }
 }
 
-/// Shrinks a grayscale coverage mask with area averaging, which gives clean
-/// antialiased edges at tray sizes.
+/// Shrinks a grayscale mask from `sw`×`sh` to `dw`×`dh` with area averaging:
+/// every destination pixel is the exact average of the source area it
+/// covers, including fractional rows and columns at its edges. Slower than
+/// nearest/bilinear but this runs once per colour change on a 134-px
+/// image, and the result has no aliasing at tray sizes.
 pub fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     let mut dst = vec![0u8; dw * dh];
     let fx = sw as f64 / dw as f64;
@@ -141,8 +182,15 @@ pub fn resample(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u
     dst
 }
 
-/// Builds a premultiplied 32-bpp ARGB image and turns it into an HICON.
-/// Returns the icon and, if `keep_pixels`, a copy of the BGRA pixels.
+/// Renders the icon for `lv` at `sz` pixels and turns it into an `HICON`.
+///
+/// The colour bitmap is a top-down 32-bpp DIB section filled by
+/// [`draw_icon`]; the mask bitmap is a blank 1-bpp bitmap because the alpha
+/// channel does the masking. `CreateIconIndirect` copies both, so they are
+/// deleted before returning. The caller owns the icon (`DestroyIcon`).
+///
+/// With `keep_pixels` a copy of the BGRA pixels is returned as well, for
+/// `-render-test`.
 pub fn render_icon(
     sz: usize,
     lv: Level,
@@ -204,7 +252,8 @@ pub fn render_icon(
     }
 }
 
-/// Converts premultiplied BGRA to straight-alpha RGBA rows.
+/// Converts premultiplied BGRA (as in the DIB) to straight-alpha RGBA (as in
+/// a PNG). Fully transparent pixels stay black.
 pub fn to_rgba(sz: usize, pix: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; sz * sz * 4];
     for (src, dst) in pix
@@ -223,7 +272,10 @@ pub fn to_rgba(sz: usize, pix: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Minimal PNG encoder (RGBA, stored/uncompressed deflate) for `--render-test`.
+/// Minimal PNG encoder for `-render-test`: 8-bit RGBA, filter type 0 on
+/// every row, and a zlib stream made of *stored* (uncompressed) deflate
+/// blocks. Files are larger than necessary but every viewer reads them, and
+/// it keeps the crate free of an image dependency.
 pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
     fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
         out.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -267,6 +319,7 @@ pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Vec<u8> {
     out
 }
 
+/// CRC-32 (IEEE, as used by PNG chunks), bitwise implementation.
 fn crc32(data: &[u8]) -> u32 {
     let mut c = 0xFFFF_FFFFu32;
     for &b in data {
@@ -282,6 +335,7 @@ fn crc32(data: &[u8]) -> u32 {
     !c
 }
 
+/// Adler-32 checksum that terminates a zlib stream.
 fn adler32(data: &[u8]) -> u32 {
     let (mut a, mut b) = (1u32, 0u32);
     for &d in data {

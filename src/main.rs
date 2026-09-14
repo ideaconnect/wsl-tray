@@ -1,5 +1,48 @@
-//! WSL Tray: a tiny tray indicator for WSL2 (on/off, CPU and memory share of
-//! the host, one-click shutdown). Pure Win32 through `windows-sys`.
+//! wsl-tray: a tray indicator for WSL2 (on/off, CPU and memory share of the
+//! host, shutdown from the menu). Pure Win32 through `windows-sys`.
+//!
+//! # How the program is put together
+//!
+//! ```text
+//!  main()            parse flags, single-instance mutex, create App
+//!    |
+//!    +-- create_window()      hidden top-level window; owns the tray icon,
+//!    |                        receives its callbacks and the poll timer
+//!    +-- add_tray_icon()      Shell_NotifyIconW(NIM_ADD), version 4
+//!    +-- SetTimer(-poll)      WM_TIMER every 5 s by default
+//!    +-- message loop         GetMessageW / DispatchMessageW until WM_QUIT
+//!
+//!  wnd_proc -> App::handle
+//!    WM_TIMER          -> tick(): Monitor::poll(), redraw icon/tooltip if changed
+//!    WM_TRAY_CALLBACK  -> show_menu() on click / keyboard select / context menu
+//!    WM_REFRESH_NOW    -> tick(true), posted by the shutdown thread when done
+//!    TaskbarCreated    -> add_tray_icon() again after an Explorer restart
+//!    WM_DESTROY        -> remove the icon, PostQuitMessage
+//! ```
+//!
+//! The modules split as follows:
+//!
+//! * [`monitor`] finds the WSL2 VM process and computes CPU / memory numbers.
+//!   It knows nothing about the UI.
+//! * [`icon`] turns a [`icon::Level`] (off / ok / warn / high) into an `HICON`
+//!   from the embedded Tux mask, and has the PNG writer used by `-render-test`.
+//! * this file: command line, window, tray icon, menu, registry (autostart and
+//!   the Windows 11 "show next to the clock" flag), diagnostics log.
+//!
+//! # Threading
+//!
+//! Everything runs on the main thread, which is also the UI thread. The one
+//! exception is the thread that waits for `wsl --shutdown`; it talks back only
+//! through `PostMessageW(WM_REFRESH_NOW)`, which is thread-safe.
+//!
+//! # Re-entrancy
+//!
+//! `TrackPopupMenuEx`, `MessageBoxW` and even `Shell_NotifyIconW` run a nested
+//! message loop, so `wnd_proc` can be entered again while one of them is on
+//! the stack. Application state therefore lives in [`App`] behind `Cell` /
+//! `RefCell`, and no `RefCell` borrow is ever held across a call that can pump
+//! messages. [`App::menu_open`] additionally stops a second menu from opening
+//! while the first one, or a dialog it launched, is still up.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod icon;
@@ -40,12 +83,22 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use icon::Level;
 use monitor::{format_bytes, shutdown_wsl, Monitor, Status};
 
-const WM_TRAY_CALLBACK: u32 = WM_APP + 1; // Shell_NotifyIcon callback
-const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY; // not exported by windows-sys
-const WM_REFRESH_NOW: u32 = WM_APP + 2; // posted from the shutdown thread
+/// Private message the shell sends to our window for tray-icon events
+/// (`NOTIFYICONDATAW::uCallbackMessage`). With `NOTIFYICON_VERSION_4` the
+/// event id is in the low word of `lParam`.
+const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
+/// Keyboard activation of the icon (Enter/Space). `windows-sys` exports
+/// `NIN_SELECT` and `NINF_KEY` but not their combination.
+const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
+/// Posted by the shutdown thread once `wsl --shutdown` has returned, so the
+/// UI thread re-polls immediately instead of waiting for the next timer tick.
+const WM_REFRESH_NOW: u32 = WM_APP + 2;
 
+/// `SetTimer` id of the poll timer.
 const TIMER_POLL: usize = 1;
 
+// Menu command ids returned by TrackPopupMenuEx(TPM_RETURNCMD). Status lines
+// are disabled items and are never returned, but still need distinct ids.
 const IDM_STATUS: usize = 1;
 const IDM_STATS: usize = 2;
 const IDM_SHUTDOWN: usize = 3;
@@ -53,24 +106,39 @@ const IDM_REFRESH: usize = 4;
 const IDM_AUTOSTART: usize = 5;
 const IDM_EXIT: usize = 6;
 
+/// Window class of the hidden window. Also handy for finding the window from
+/// outside (`FindWindowW`) when automating tests.
 const CLASS_NAME: &str = "WSLTrayWindow";
+/// Caption used for message boxes.
 const APP_TITLE: &str = "WSL2 Tray";
 
+/// Per-user autostart key and the value name written there by
+/// "Start with Windows".
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "WSLTray";
 
-/// NUL-terminated UTF-16.
+/// Encodes a string as NUL-terminated UTF-16 for the `*W` Win32 functions.
+///
+/// The returned `Vec` must outlive the call it is passed to; for structures
+/// that keep the pointer (e.g. `WNDCLASSEXW::lpszClassName`) bind it to a
+/// local first.
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 // ---- command line ----
 
+/// Parsed command line. Defaults are documented in [`USAGE`].
 struct Options {
+    /// Interval of the presence check (`-poll`).
     poll: Duration,
+    /// Interval of the CPU/memory refresh while the VM runs (`-interval`).
     stats: Duration,
+    /// Image name of the VM process (`-process`), matched case-insensitively.
     process: String,
+    /// Diagnostics log file (`-log`), appended to.
     log: Option<String>,
+    /// Directory for the icon PNG dump (`-render-test`); exits afterwards.
     render_test: Option<String>,
 }
 
@@ -168,11 +236,13 @@ fn parse_args() -> Result<Option<Options>, String> {
 
 // ---- diagnostics ----
 
+/// The `-log` file, if one was opened. Shared with the shutdown thread.
 static LOG: Mutex<Option<File>> = Mutex::new(None);
+/// Cheap pre-check so the poll path does no formatting when logging is off.
 static LOG_ON: AtomicBool = AtomicBool::new(false);
 
-/// Appends a line to the `--log` file. Without one, the arguments are not
-/// even formatted.
+/// Appends a line to the `-log` file. Without one, the arguments are not
+/// even formatted. Same line format as the Go version's `log` package.
 macro_rules! log {
     ($($a:tt)*) => {
         if LOG_ON.load(Ordering::Relaxed) {
@@ -195,6 +265,7 @@ fn log_write(args: std::fmt::Arguments) {
     }
 }
 
+/// Local wall-clock time via `GetLocalTime` (no chrono dependency needed).
 fn local_time() -> SYSTEMTIME {
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
     let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
@@ -202,40 +273,78 @@ fn local_time() -> SYSTEMTIME {
     t
 }
 
+/// `MessageBoxW` with the application title. Returns the button id (`IDYES`
+/// etc.). Blocks and pumps messages until dismissed, see the re-entrancy note
+/// in the module docs.
 fn message_box(hwnd: HWND, text: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(hwnd, wide(text).as_ptr(), wide(APP_TITLE).as_ptr(), flags) }
 }
 
 // ---- application state ----
-//
-// The window procedure is re-entered while TrackPopupMenu/MessageBox pump
-// messages, so state lives in Cell/RefCell fields and no borrow is held across
-// a Win32 call that can dispatch messages.
 
+/// All mutable state of the program. There is exactly one instance, stored in
+/// the [`APP`] thread-local of the UI thread and reached through
+/// [`with_app`] from the window procedure.
+///
+/// Every field is a `Cell` or `RefCell` because the window procedure is
+/// re-entered while `TrackPopupMenuEx` / `MessageBoxW` / `Shell_NotifyIconW`
+/// pump messages; see the module docs. No `RefCell` borrow is held across
+/// such a call.
 struct App {
+    /// The hidden window that owns the tray icon and the popup menu.
     hwnd: Cell<HWND>,
+    /// The `NOTIFYICONDATAW` last passed to the shell. Kept so `NIM_MODIFY`
+    /// and `NIM_DELETE` can reuse the same identity (`hWnd` + `uID`).
     nid: RefCell<NOTIFYICONDATAW>,
+    /// Current tray icon. Replaced (and the old one destroyed) only when the
+    /// colour level changes.
     hicon: Cell<HICON>,
+    /// The WSL2 sampler.
     mon: RefCell<Monitor>,
+    /// Icon edge length in pixels: `SM_CXSMICON` at the current DPI
+    /// (16 at 100 %, 20 at 125 %, 24 at 150 %, ...).
     icon_size: usize,
+    /// True between the user confirming "Shut down WSL2" and the shutdown
+    /// thread posting `WM_REFRESH_NOW`. Greys out the menu item meanwhile.
     shutting_down: Cell<bool>,
+    /// Re-entrancy guard for [`App::show_menu`]; held until the chosen
+    /// command (including any dialog it shows) has finished.
     menu_open: Cell<bool>,
+    /// Id of the registered `"TaskbarCreated"` message, broadcast by a new
+    /// Explorer instance; the icon has to be added again then.
     taskbar_created: Cell<u32>,
+    /// Colour level of `hicon`, to skip redundant re-renders.
     last_level: Cell<Option<Level>>,
+    /// Windows 11 promotion (see [`promote_tray_icon`]) is done, or not
+    /// applicable on this Windows version.
     promoted: Cell<bool>,
+    /// Number of promotion attempts; Explorer creates the registry entry a
+    /// little after `NIM_ADD`, so the first attempts may find nothing.
     promote_tries: Cell<u32>,
+    /// Canonical executable path in Win32 syntax, used to find our entry
+    /// under `NotifyIconSettings` (Explorer stores the resolved path there).
     exe_path: String,
+    /// Arguments this instance was started with, replayed into the autostart
+    /// Run value so an autostarted copy behaves the same.
     launch_args: Vec<String>,
 }
 
 thread_local! {
+    /// The single [`App`], owned by the UI thread. `OnceCell` rather than
+    /// `RefCell<Option<App>>` so a re-entered `wnd_proc` never hits a borrow
+    /// panic just for looking the state up.
     static APP: OnceCell<App> = const { OnceCell::new() };
 }
 
+/// Runs `f` with the [`App`] if it has been created (it always has by the
+/// time any window message arrives, but `wnd_proc` cannot assume that).
 fn with_app<R>(f: impl FnOnce(&App) -> R) -> Option<R> {
     APP.with(|a| a.get().map(f))
 }
 
+/// Entry point: parses flags, handles the `-render-test` and single-instance
+/// early exits, creates the window and icon, then runs the message loop until
+/// `WM_QUIT`.
 fn main() {
     let opts = match parse_args() {
         Ok(Some(o)) => o,
@@ -264,7 +373,9 @@ fn main() {
         }
     }
 
-    // Single instance. The mutex is intentionally leaked for the process lifetime.
+    // Single instance per session: a named mutex in the Local\ namespace. If
+    // it already exists another copy is running and this one exits quietly.
+    // The handle is intentionally leaked; the OS releases it with the process.
     unsafe {
         CreateMutexW(null(), 0, wide(r"Local\WSLTray.SingleInstance").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -318,6 +429,8 @@ fn main() {
         unsafe { SetTimer(a.hwnd.get(), TIMER_POLL, opts.poll.as_millis() as u32, None) };
     });
 
+    // Standard message loop. GetMessageW returns 0 on WM_QUIT and -1 on error;
+    // both end the program.
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -328,6 +441,13 @@ fn main() {
 }
 
 impl App {
+    /// Registers the window class and creates the hidden window.
+    ///
+    /// It is a normal top-level window with no style bits and no `ShowWindow`
+    /// call, so it never appears. A message-only window (`HWND_MESSAGE`)
+    /// would not do: `TrackPopupMenuEx` needs an owner that can be brought to
+    /// the foreground, otherwise the menu does not close when the user clicks
+    /// elsewhere.
     fn create_window(&self) -> Result<(), String> {
         unsafe {
             let hinst = GetModuleHandleW(null());
@@ -377,6 +497,8 @@ impl App {
         }
     }
 
+    /// Message handler. Returns `Some(result)` for messages it consumed and
+    /// `None` to let `DefWindowProcW` handle everything else.
     fn handle(&self, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
         match msg {
             WM_TRAY_CALLBACK => {
@@ -398,6 +520,8 @@ impl App {
                 Some(0)
             }
             WM_REFRESH_NOW => {
+                // The shutdown thread is done; re-enable the menu item and
+                // show the new state right away.
                 self.shutting_down.set(false);
                 self.tick(true);
                 Some(0)
@@ -407,6 +531,7 @@ impl App {
                 Some(0)
             }
             WM_DESTROY => {
+                // Tear down in reverse order of creation, then end the loop.
                 unsafe {
                     KillTimer(hwnd, TIMER_POLL);
                     Shell_NotifyIconW(NIM_DELETE, &*self.nid.borrow());
@@ -419,14 +544,17 @@ impl App {
                 Some(0)
             }
             m if m != 0 && m == self.taskbar_created.get() => {
-                self.add_tray_icon(); // Explorer restarted
+                // Explorer was restarted (or crashed): its tray forgot us.
+                self.add_tray_icon();
                 Some(0)
             }
             _ => None,
         }
     }
 
-    /// Polls WSL2 and refreshes icon + tooltip when something changed.
+    /// One poll cycle: asks the [`Monitor`] for the current state and, if
+    /// anything visible changed (or the icon does not exist yet), updates
+    /// the icon and tooltip. `force` bypasses the stats interval.
     fn tick(&self, force: bool) {
         let (st, changed) = self.mon.borrow_mut().poll(force);
         log!(
@@ -442,8 +570,13 @@ impl App {
         self.update_icon(&st);
     }
 
+    /// Pushes `st` to the shell: re-renders the icon if its colour level
+    /// changed, rewrites the tooltip, and calls `NIM_MODIFY`.
+    ///
+    /// The previous icon is destroyed only after the new one has been
+    /// created; the shell copies the icon during `NIM_MODIFY`, so destroying
+    /// the old handle afterwards is safe.
     fn update_icon(&self, st: &Status) {
-        // Re-render the HICON only when its colour changes.
         let lv = Level::for_status(st);
         if self.last_level.get() != Some(lv) || self.hicon.get().is_null() {
             if let Ok((h, _)) = icon::render_icon(self.icon_size, lv, false) {
@@ -461,6 +594,11 @@ impl App {
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &*nid) };
     }
 
+    /// Adds the icon to the notification area and switches it to
+    /// `NOTIFYICON_VERSION_4` behaviour, under which the shell sends
+    /// `NIN_SELECT` / `NIN_KEYSELECT` / `WM_CONTEXTMENU` in `lParam`'s low
+    /// word instead of raw mouse messages only. Also used after an Explorer
+    /// restart, hence the full re-initialisation of `nid`.
     fn add_tray_icon(&self) {
         let mut nid = self.nid.borrow_mut();
         *nid = unsafe { std::mem::zeroed() };
@@ -479,8 +617,14 @@ impl App {
         }
     }
 
+    /// Builds and shows the popup menu at the cursor, then runs the chosen
+    /// command. Used for left click, right click and keyboard activation.
+    ///
+    /// The menu is rebuilt on every click because its contents (the stats
+    /// line, the enabled/checked states) depend on the current status.
     fn show_menu(&self) {
-        // TrackPopupMenu pumps messages, so guard against re-entry.
+        // TrackPopupMenuEx pumps messages, so a second tray click would land
+        // here again while the first menu is still open.
         if self.menu_open.replace(true) {
             return;
         }
@@ -518,8 +662,13 @@ impl App {
             let mut pt = POINT { x: 0, y: 0 };
             GetCursorPos(&mut pt);
             let hwnd = self.hwnd.get();
-            // Required, otherwise the menu won't dismiss when focus moves away.
+            // The documented tray-menu dance (KB 135788): the owner must be the
+            // foreground window or the menu will not close when the user
+            // clicks elsewhere, and posting a no-op message afterwards makes
+            // the menu go away promptly once the next click lands.
             SetForegroundWindow(hwnd);
+            // TPM_BOTTOMALIGN: the menu opens upwards from the taskbar.
+            // TPM_RETURNCMD: the chosen id is returned instead of a WM_COMMAND.
             let cmd = TrackPopupMenuEx(
                 menu,
                 TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -530,7 +679,7 @@ impl App {
             );
             PostMessageW(hwnd, WM_NULL, 0, 0);
             DestroyMenu(menu);
-            cmd as usize
+            cmd as usize // 0 = dismissed without a choice
         };
 
         log!("menu command {cmd}");
@@ -552,6 +701,9 @@ impl App {
         self.menu_open.set(false);
     }
 
+    /// "Shut down WSL2": asks for confirmation (default button is No), then
+    /// runs `wsl --shutdown` on a helper thread so the UI keeps responding.
+    /// The thread reports back with `WM_REFRESH_NOW`.
     fn shutdown(&self) {
         if self.shutting_down.get() {
             return;
@@ -565,7 +717,9 @@ impl App {
             return;
         }
         self.shutting_down.set(true);
-        let hwnd = self.hwnd.get() as isize; // HWND is not Send; it is only used with PostMessageW
+        // HWND is a raw pointer and therefore not Send; carry it as an integer.
+        // The thread only ever hands it to PostMessageW, which is thread-safe.
+        let hwnd = self.hwnd.get() as isize;
         std::thread::spawn(move || {
             if let Err(e) = shutdown_wsl() {
                 message_box(null_mut(), &e, MB_ICONERROR);
@@ -592,6 +746,9 @@ impl App {
 
     // ---- autostart (HKCU\...\Run) ----
 
+    /// Writes or deletes the `Run` value. The value is the quoted launch path
+    /// followed by this instance's own arguments, so `-poll`/`-log` settings
+    /// survive into the autostarted copy.
     fn set_autostart(&self, enable: bool) -> Result<(), String> {
         let key = RegKey::open(HKEY_CURRENT_USER, RUN_KEY, KEY_READ | KEY_WRITE)?;
         if !enable {
@@ -611,6 +768,8 @@ impl App {
     }
 }
 
+/// The window procedure registered in [`App::create_window`]. Forwards to
+/// [`App::handle`]; anything not handled there goes to `DefWindowProcW`.
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if let Some(Some(r)) = with_app(|a| a.handle(hwnd, msg, wparam, lparam)) {
         return r;
@@ -618,6 +777,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+/// Tooltip text: state, the stats line, and when it was last sampled.
 fn tooltip(st: &Status) -> String {
     if !st.running {
         return "WSL2: stopped".into();
@@ -629,6 +789,8 @@ fn tooltip(st: &Status) -> String {
     s
 }
 
+/// `CPU 12.4 %   MEM 5.40 GB (11.2 %)`; CPU shows `...` until the second
+/// sample after the VM appeared.
 fn stats_line(st: &Status) -> String {
     let cpu = match st.cpu {
         Some(c) => format!("{c:.1} %"),
@@ -641,6 +803,8 @@ fn stats_line(st: &Status) -> String {
     )
 }
 
+/// Copies `s` into `szTip` (128 UTF-16 units including the terminator),
+/// truncating if needed.
 fn set_tip(nid: &mut NOTIFYICONDATAW, s: &str) {
     let mut u: Vec<u16> = s.encode_utf16().collect();
     u.truncate(nid.szTip.len() - 1);
@@ -650,9 +814,12 @@ fn set_tip(nid: &mut NOTIFYICONDATAW, s: &str) {
 
 // ---- registry helpers ----
 
+/// An open registry key, closed on drop. Only the handful of operations the
+/// program needs are wrapped.
 struct RegKey(HKEY);
 
 impl RegKey {
+    /// Opens `root\sub` with the given `KEY_*` access mask.
     fn open(root: HKEY, sub: &str, access: u32) -> Result<RegKey, String> {
         let mut h: HKEY = null_mut();
         let r = unsafe { RegOpenKeyExW(root, wide(sub).as_ptr(), 0, access, &mut h) };
@@ -662,6 +829,8 @@ impl RegKey {
         Ok(RegKey(h))
     }
 
+    /// Reads a `REG_SZ` / `REG_EXPAND_SZ` value (unexpanded, up to 1023
+    /// characters). `None` if absent or of another type.
     fn read_string(&self, name: &str) -> Option<String> {
         let mut typ = 0u32;
         let mut buf = vec![0u16; 1024];
@@ -684,6 +853,7 @@ impl RegKey {
         Some(String::from_utf16_lossy(&buf[..end]))
     }
 
+    /// Reads a `REG_DWORD` value; `None` if absent or of another type.
     fn read_dword(&self, name: &str) -> Option<u32> {
         let mut typ = 0u32;
         let mut v = 0u32;
@@ -701,6 +871,7 @@ impl RegKey {
         (r == 0 && typ == REG_DWORD).then_some(v)
     }
 
+    /// True if the value exists, whatever its type (a size-only query).
     fn value_exists(&self, name: &str) -> bool {
         let mut typ = 0u32;
         let mut len = 0u32;
@@ -716,7 +887,7 @@ impl RegKey {
         }
     }
 
-    /// Fails with the Win32 error code.
+    /// Writes a `REG_SZ` value. Fails with the Win32 error code.
     fn set_string(&self, name: &str, value: &str) -> Result<(), u32> {
         let u = wide(value);
         let r = unsafe {
@@ -735,6 +906,7 @@ impl RegKey {
         Ok(())
     }
 
+    /// Writes a `REG_DWORD` value; failure is ignored (best effort).
     fn set_dword(&self, name: &str, value: u32) {
         unsafe {
             RegSetValueExW(
@@ -748,6 +920,8 @@ impl RegKey {
         }
     }
 
+    /// Name of the `index`-th subkey, or `None` past the end (key names are
+    /// at most 255 characters, so the fixed buffer always suffices).
     fn subkey_name(&self, index: u32) -> Option<String> {
         let mut name = [0u16; 256];
         let mut n = name.len() as u32;
@@ -773,6 +947,7 @@ impl Drop for RegKey {
     }
 }
 
+/// Whether the "Start with Windows" Run value currently exists.
 fn autostart_enabled() -> bool {
     RegKey::open(HKEY_CURRENT_USER, RUN_KEY, KEY_READ)
         .map(|k| k.value_exists(RUN_VALUE))
@@ -792,7 +967,18 @@ fn win32_path(p: &str) -> String {
     }
 }
 
-/// Returns true once the NotifyIconSettings entry was found and handled.
+/// Windows 11 hides new tray icons in the overflow flyout by default. The
+/// per-icon choice lives under `HKCU\Control Panel\NotifyIconSettings\<id>`,
+/// where Explorer records `ExecutablePath` and (once the user has decided)
+/// `IsPromoted`. Setting `IsPromoted = 1` ourselves shows the icon next to
+/// the clock, and Explorer picks the change up live.
+///
+/// Only an *absent* value is written: if the user has already hidden or shown
+/// the icon in Settings › Taskbar, that choice stands.
+///
+/// Returns true once the entry was found and handled, or when this Windows
+/// version has no such key (Windows 10). Explorer creates the entry a little
+/// after `NIM_ADD`, so the caller retries on the next timer ticks.
 fn promote_tray_icon(exe: &str) -> bool {
     const BASE: &str = r"Control Panel\NotifyIconSettings";
     let Ok(root) = RegKey::open(HKEY_CURRENT_USER, BASE, KEY_READ) else {
@@ -820,8 +1006,11 @@ fn promote_tray_icon(exe: &str) -> bool {
     false // not found (yet)
 }
 
-// ---- --render-test: dump icons as PNG for a visual check ----
+// ---- -render-test: dump icons as PNG for a visual check ----
 
+/// Writes `icon-<size>-<state>.png` for every state at the tray sizes
+/// (16–32 px), 48 px and 256 px. The 256 px files are also the source of the
+/// exe icon in `winres/`.
 fn render_test(dir: &str) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     for sz in [16usize, 20, 24, 32, 48, 256] {

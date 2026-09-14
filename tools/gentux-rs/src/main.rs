@@ -2,10 +2,22 @@
 //! coverage mask plus a hole mask and writes them as `assets/tux.bin`, so the
 //! tray app itself needs no vector rasterizer or font at runtime.
 //!
-//! This is a port of `tools/gentux/main.go`; the Go tool is the behavioural
-//! reference. The only intentional difference is the rasterizer:
-//! `golang.org/x/image/vector` there, `tiny-skia` here, so anti-aliased edge
-//! pixels may differ by a few units.
+//! This is a port of the Go tool that shipped with the original Go version of
+//! wsl-tray (git history, commit 59e15d2, `legacy/go/tools/gentux`). The only
+//! intentional difference is the rasterizer: `golang.org/x/image/vector`
+//! there, `tiny-skia` here, so anti-aliased edge pixels may differ by a few
+//! units; the hole topology and dimensions are identical.
+//!
+//! Steps, in order:
+//!
+//! 1. Read `linux.svg` next to this crate and take its first `d="..."` path.
+//! 2. Fill it white on transparent at [`MASK_H`] px height with a [`PAD`]
+//!    margin; the alpha channel is the coverage.
+//! 3. Flood-fill from the canvas border through non-solid pixels; whatever
+//!    non-solid pixels remain are the enclosed holes (belly, face).
+//! 4. Dilate the coverage by [`STROKE_GROW`] px so the thin outline survives
+//!    at 20–24 px tray sizes, and drop hole pixels the dilation swallowed.
+//! 5. Crop both planes to the glyph's bounding box and write the file.
 //!
 //! Output format (`assets/tux.bin`): u16 LE width, u16 LE height, then
 //! `w*h` coverage bytes, then `w*h` hole bytes (255 = enclosed transparent
@@ -27,6 +39,7 @@ const MASK_H: usize = 128;
 const STROKE_GROW: i32 = 3;
 /// Margin around the rasterized glyph so the dilation has room.
 const PAD: usize = 8;
+/// The SVG's `viewBox` (Font Awesome brand icons are 448×512).
 const VIEW_BOX_W: f64 = 448.0;
 const VIEW_BOX_H: f64 = 512.0;
 /// Coverage at or above this counts as solid for hole detection.

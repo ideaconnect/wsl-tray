@@ -1,5 +1,9 @@
 # wsl-tray
 
+[![build](https://github.com/ideaconnect/wsl-tray/actions/workflows/build.yml/badge.svg)](https://github.com/ideaconnect/wsl-tray/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/ideaconnect/wsl-tray)](https://github.com/ideaconnect/wsl-tray/releases)
+[![Made in the EU](https://raw.githubusercontent.com/ideaconnect/made-in-the-eu/main/software-badge/made-in-the-eu.svg)](https://github.com/ideaconnect/made-in-the-eu)
+
 Windows tray icon that shows whether the WSL2 VM is running and how much CPU
 and memory it uses, with a menu entry that shuts it down.
 
@@ -152,6 +156,11 @@ res/               resource objects; winres/ has their sources
 tools/gentux-rs/   mask generator
 docs/              screenshots
 ```
+
+Each source file starts with a module comment that explains its part of the
+program (the message flow and re-entrancy rules in `main.rs`, why the
+process list is read the way it is in `monitor.rs`, the icon pipeline in
+`icon.rs`). `cargo doc --document-private-items --open` renders all of it.
 
 ## License
 
