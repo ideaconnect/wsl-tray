@@ -1,0 +1,90 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --release --target ${{ matrix.target }} -- -D warnings
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Test
+        if: matrix.arch == 'x64'
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Mask generator (fmt, clippy, build, test)
+        if: matrix.arch == 'x64'
+        working-directory: tools/gentux-rs
+        run: |
+          cargo fmt --check
+          cargo clippy --release -- -D warnings
+          cargo test --release
+
+      - name: Report size
+        shell: pwsh
+        run: |
+          $exe = Get-Item "target/${{ matrix.target }}/release/wsl-tray.exe"
+          "wsl-tray.exe (${{ matrix.arch }}): $($exe.Length) bytes" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsl-tray-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/wsl-tray.exe
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Name the binaries
+        run: |
+          mv dist/wsl-tray-x64/wsl-tray.exe dist/wsl-tray-x64.exe
+          mv dist/wsl-tray-arm64/wsl-tray.exe dist/wsl-tray-arm64.exe
+          (cd dist && sha256sum wsl-tray-x64.exe wsl-tray-arm64.exe > SHA256SUMS)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "wsl-tray $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/wsl-tray-x64.exe dist/wsl-tray-arm64.exe dist/SHA256SUMS

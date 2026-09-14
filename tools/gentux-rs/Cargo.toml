@@ -1,0 +1,13 @@
+[package]
+name = "gentux-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rasterizes the Font Awesome Tux glyph into assets/tux.bin (coverage + hole masks)"
+license = "BSD-3-Clause"
+publish = false
+
+# Standalone crate: keep it out of the parent wsl-tray package/workspace.
+[workspace]
+
+[dependencies]
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "simd"] }
