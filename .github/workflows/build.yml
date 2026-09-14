@@ -33,22 +33,23 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --release --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --locked --release --all-targets --target ${{ matrix.target }} -- -D warnings
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Test
         if: matrix.arch == 'x64'
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --locked --release --target ${{ matrix.target }}
 
       - name: Mask generator (fmt, clippy, build, test)
         if: matrix.arch == 'x64'
+        shell: bash
         working-directory: tools/gentux-rs
         run: |
           cargo fmt --check
-          cargo clippy --release -- -D warnings
-          cargo test --release
+          cargo clippy --locked --release --all-targets -- -D warnings
+          cargo test --locked --release
 
       - name: Report size
         shell: pwsh

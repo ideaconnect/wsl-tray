@@ -299,8 +299,8 @@ mod tests {
     fn mask_loads() {
         let m = tux();
         assert!(m.w > 0 && m.h > 0);
-        assert!(m.cov.iter().any(|&v| v == 255));
-        assert!(m.holes.iter().any(|&v| v == 255));
+        assert!(m.cov.contains(&255));
+        assert!(m.holes.contains(&255));
     }
 
     #[test]

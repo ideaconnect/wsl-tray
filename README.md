@@ -1,11 +1,11 @@
 # wsl-tray
 
-A small tray icon for Windows that tells you whether WSL2 is running, how much
-CPU and memory it is taking, and lets you shut it down with two clicks.
+Windows tray icon that shows whether the WSL2 VM is running and how much CPU
+and memory it uses, with a menu entry that shuts it down.
 
 ![Tray icon while WSL2 is running](docs/tray-running.png)
 
-It sits next to the clock like the keyboard-layout badge. Gray means the WSL2
+It sits next to the clock like the keyboard-layout badge. Grey means the WSL2
 VM is off; green, orange or red means it is running and shows how much of the
 machine it is using.
 
@@ -31,11 +31,11 @@ Click (left or right) for the menu:
 
 ## Download
 
-Prebuilt `wsl-tray.exe` for x64 and ARM64 are attached to each
-[release](https://github.com/ideaconnect/wsl-tray/releases). There is nothing
-to install: put the file somewhere permanent, run it, and tick **Start with
-Windows** in the menu if you want it back after a reboot. It does not need
-administrator rights.
+Each [release](https://github.com/ideaconnect/wsl-tray/releases) has
+`wsl-tray-x64.exe` and `wsl-tray-arm64.exe` attached, with a `SHA256SUMS`
+file. There is nothing to install: put the file somewhere permanent, run it,
+and tick **Start with Windows** in the menu if you want it back after a
+reboot. It does not need administrator rights.
 
 On Windows 11 the icon shows up next to the clock on first run (the app sets
 its own `IsPromoted` flag in `HKCU\Control Panel\NotifyIconSettings`, but only
@@ -61,16 +61,16 @@ work. Durations are written like `30s`, `1m30s` or `250ms`.
 ## Resource usage
 
 Measured on Windows 11 25H2, AMD Ryzen AI MAX+ 395 (32 logical cores, 48 GB),
-150 % display scaling, with the release build from this repository.
+125 % display scaling, with the release build from this repository.
 
 | | |
 |---|---|
-| Executable | 282 KB (x64) |
-| Private memory | 2.5–3 MB |
-| Working set | 10 MB after start, ~18 MB after the menu and tooltip have been shown (shared theme/common-control DLLs) |
-| Threads | 1–4 (the extra ones are Windows' own thread-pool and GDI helpers; one more exists while `wsl --shutdown` runs) |
+| Executable | 282 KB (x64), 270 KB (ARM64) |
+| Private memory | 2.5 MB at start, 3.9 MB after half an hour |
+| Working set | 10 MB at start, ~19 MB once the menu and tooltip have been shown (shared theme and common-control DLLs) |
+| Threads | 1 while idle; up to 3 more appear briefly for GDI and the thread pool, and one runs `wsl --shutdown` |
 | One presence check | 3.8 ms for a full process-list snapshot (~250 processes) |
-| Idle CPU | about 0.8 ms of CPU per second at the default 5 s poll, i.e. 0.08 % of one core |
+| Idle CPU | 1.1 ms of CPU per second over a 23-minute window with the VM running (0.11 % of one core, 0.003 % of the machine) |
 
 The only dependency is [`windows-sys`](https://crates.io/crates/windows-sys),
 which contains nothing but `extern` declarations. There is no runtime, no COM,
@@ -103,7 +103,7 @@ prints the per-poll cost on your machine.
 
 ## Building
 
-You need a stable Rust toolchain with the MSVC target.
+You need a stable Rust toolchain (1.88 or newer) with the MSVC target.
 
 ```powershell
 .\build.ps1
@@ -156,4 +156,5 @@ docs/              screenshots
 ## License
 
 BSD 3-Clause, see [LICENSE](LICENSE). The Tux glyph is the "linux" icon from
-[Font Awesome Free](https://fontawesome.com), CC BY 4.0.
+[Font Awesome Free](https://fontawesome.com), CC BY 4.0; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

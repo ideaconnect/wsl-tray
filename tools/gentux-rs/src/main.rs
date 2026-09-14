@@ -423,6 +423,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)] // indices are written as row * width + col
     fn dilate_uses_disc_neighbourhood() {
         let mut m = vec![0u8; 49];
         m[3 * 7 + 3] = 200;
