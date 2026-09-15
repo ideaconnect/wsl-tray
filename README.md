@@ -35,7 +35,14 @@ Click (left or right) for the menu:
 
 ## Download
 
-Each [release](https://github.com/ideaconnect/wsl-tray/releases) has
+<p align="center">
+  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-x64.exe"><img src="https://img.shields.io/badge/Download-AMD64-0078D4?style=for-the-badge" alt="Download AMD64"></a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-arm64.exe"><img src="https://img.shields.io/badge/Download-ARM64-0078D4?style=for-the-badge" alt="Download ARM64"></a>
+</p>
+
+The buttons always fetch the latest release. Each
+[release](https://github.com/ideaconnect/wsl-tray/releases) has
 `wsl-tray-x64.exe` and `wsl-tray-arm64.exe` attached, with a `SHA256SUMS`
 file. There is nothing to install: put the file somewhere permanent, run it,
 and tick **Start with Windows** in the menu if you want it back after a
@@ -44,6 +51,16 @@ reboot. It does not need administrator rights.
 On Windows 11 the icon shows up next to the clock on first run (the app sets
 its own `IsPromoted` flag in `HKCU\Control Panel\NotifyIconSettings`, but only
 if you have not already decided about it in Settings › Taskbar).
+
+## Sponsoring
+
+If wsl-tray is useful to you, you can support its development:
+
+<p align="center">
+  <a href="https://github.com/sponsors/ideaconnect"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub"></a>
+  &nbsp;&nbsp;
+  <a href="https://buymeacoffee.com/idct"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy me a coffee"></a>
+</p>
 
 ## Command line
 
