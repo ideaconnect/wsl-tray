@@ -10,11 +10,20 @@
 //! after the last distribution exits).
 //!
 //! The VM process runs as SYSTEM, so `OpenProcess` on it fails for a normal
-//! user and `GetProcessTimes` / `GetProcessMemoryInfo` are out.
-//! `NtQuerySystemInformation(SystemProcessInformation)` returns the same
-//! numbers for every process without opening anything, which is how Task
-//! Manager does it too. It is an undocumented-but-stable ntdll export; the
-//! function is resolved with `GetProcAddress` so no import library is needed.
+//! user with every access mask, even `SYNCHRONIZE`, and `GetProcessTimes` /
+//! `GetProcessMemoryInfo` are out. `NtQuerySystemInformation` returns the
+//! same numbers for every process without opening anything, which is how
+//! Task Manager does it too. It is an undocumented-but-stable ntdll export;
+//! the function is resolved with `GetProcAddress` so no import library is
+//! needed. Two of its information classes are used:
+//!
+//! * `SystemSessionProcessInformation`, the process list of one session.
+//!   The VM is created by the WSL service, so it is always in session 0,
+//!   and a session-0 list is a tenth of the size and cost of the full one
+//!   (services only, no user session). `-process` therefore has to name a
+//!   session-0 process, which every VM process is.
+//! * `SystemProcessIdInformation`, the name behind one pid: a few hundred
+//!   nanoseconds, used to confirm a known VM is still there.
 //!
 //! # What the numbers mean
 //!
@@ -28,9 +37,16 @@
 //!
 //! # Cost
 //!
-//! One snapshot copies every process entry (about 700 KB for 250 processes,
-//! ~4 ms). It is taken every `-poll` seconds; the CPU/memory numbers are only
-//! recomputed every `-interval` seconds so the tooltip does not flicker.
+//! A session-0 snapshot copies the entries of the service processes (about
+//! 260 KB, ~0.6 ms; the full list would be 830 KB and ~7 ms). While the VM
+//! is off, that is what every `-poll` does: there is no cheaper unprivileged
+//! way to notice a new process. Once the VM is known, the polls in between
+//! two `-interval` refreshes only check the name behind its pid, and take a
+//! snapshot again only when the pid is gone or has changed hands, or when
+//! the CPU/memory numbers are due. The snapshot buffer is allocated for each
+//! snapshot and freed right after, sized from the previous one, so it is not
+//! part of the process's memory between polls (the allocation costs under a
+//! percent of the snapshot).
 
 use std::ffi::c_void;
 use std::ptr::null;
@@ -68,7 +84,7 @@ pub struct Status {
 }
 
 /// Stateful sampler: remembers the previous CPU reading so the next one can
-/// be turned into a rate, and reuses one buffer for the process snapshot.
+/// be turned into a rate, and how large the last process snapshot was.
 pub struct Monitor {
     /// Image name to look for, lower-cased with full Unicode rules.
     proc_name: String,
@@ -87,8 +103,11 @@ pub struct Monitor {
     last_cpu: i64,
     /// Pid the baseline belongs to; a different pid invalidates it.
     last_pid: usize,
-    /// Snapshot buffer, grown on demand and kept between polls.
-    buf: Vec<u8>,
+    /// Size to allocate for the next snapshot: what the last one needed plus
+    /// some slack for processes started since.
+    snapshot_size: usize,
+    /// Snapshots taken so far, see [`snapshots`](Self::snapshots).
+    snapshots: u32,
     /// `ntdll!NtQuerySystemInformation`, or `None` if it could not be found
     /// (then the VM is reported as not running).
     nt_query: Option<NtQuerySystemInformationFn>,
@@ -97,10 +116,52 @@ pub struct Monitor {
 /// `NTSTATUS NtQuerySystemInformation(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG)`.
 type NtQuerySystemInformationFn = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
 
-/// `SystemProcessInformation` member of `SYSTEM_INFORMATION_CLASS`.
+/// `SystemProcessInformation` member of `SYSTEM_INFORMATION_CLASS`: the
+/// full process list, only used by the `poll_cost` benchmark for comparison.
+#[cfg(test)]
 const SYSTEM_PROCESS_INFORMATION: u32 = 5;
+/// `SystemSessionProcessInformation`: the process list of one session, in
+/// the same format, requested through [`SysSessionProcInfo`].
+const SYSTEM_SESSION_PROCESS_INFORMATION: u32 = 53;
+/// `SystemProcessIdInformation`: the image name of one pid, no snapshot.
+const SYSTEM_PROCESS_ID_INFORMATION: u32 = 88;
+/// Session of the VM process: it is created by the WSL service, which like
+/// every service runs in session 0.
+const VM_SESSION: u32 = 0;
+
+/// `SYSTEM_SESSION_PROCESS_INFORMATION`: the input of a session-restricted
+/// snapshot. `buffer` receives the same chain of entries as
+/// `SystemProcessInformation` would produce.
+#[repr(C)]
+struct SysSessionProcInfo {
+    session_id: u32,
+    size_of_buf: u32,
+    buffer: *mut c_void,
+}
 /// Returned when the buffer is too small; `needed` then holds the size.
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004_u32 as i32;
+/// Slack added to the size the last snapshot needed, for processes started
+/// since; a snapshot that still does not fit is retried with the new size.
+const SNAPSHOT_SLACK: usize = 64 * 1024;
+
+/// `UNICODE_STRING`: a counted UTF-16 string, lengths in bytes.
+#[repr(C)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+/// `SYSTEM_PROCESS_ID_INFORMATION`: `process_id` in, `image_name` out. The
+/// caller provides the string buffer. For a normal process the name is the
+/// NT path of its image (`\Device\HarddiskVolume3\...\explorer.exe`); for a
+/// minimal process such as the WSL2 VM, which has no image file, it is the
+/// bare process name (`vmmemWSL`).
+#[repr(C)]
+struct SysProcIdInfo {
+    process_id: usize,
+    image_name: UnicodeString,
+}
 
 /// Leading part of `SYSTEM_PROCESS_INFORMATION` (x64 layout, from the Windows
 /// SDK's `winternl.h` plus the documented "reserved" fields). Entries are
@@ -155,7 +216,8 @@ impl Monitor {
             last_t: Instant::now(),
             last_cpu: 0,
             last_pid: 0,
-            buf: vec![0; 512 * 1024],
+            snapshot_size: 256 * 1024,
+            snapshots: 0,
             nt_query,
         }
     }
@@ -163,6 +225,12 @@ impl Monitor {
     /// The status published by the last [`poll`](Self::poll).
     pub fn current(&self) -> Status {
         self.cur
+    }
+
+    /// Number of process-list snapshots taken so far (for the `-log` line
+    /// and the tests: a poll that only checked the pid does not add one).
+    pub fn snapshots(&self) -> u32 {
+        self.snapshots
     }
 
     /// Takes a process snapshot and updates the status.
@@ -180,8 +248,22 @@ impl Monitor {
     ///   one second is too noisy and is skipped.
     pub fn poll(&mut self, force: bool) -> (Status, bool) {
         let now = Instant::now();
-        let found = self.find();
+        let elapsed = now.duration_since(self.last_t);
 
+        // Fast path: the VM is known and no refresh is due, so a snapshot
+        // could only confirm that it still exists. Ask about its pid instead.
+        // If that no longer names our process, fall through to the snapshot,
+        // which finds a restarted VM or reports this one gone.
+        if self.cur.running
+            && !force
+            && elapsed < self.stats_every
+            && self.cur.cpu.is_some()
+            && self.alive(self.last_pid)
+        {
+            return (self.cur, false);
+        }
+
+        let found = self.find();
         let Some((pid, cpu_time, ws)) = found else {
             let changed = self.cur.running;
             self.cur = Status {
@@ -210,8 +292,9 @@ impl Monitor {
 
         // Steady state: refresh every stats_every. Right after a baseline (CPU
         // still unknown) the next poll is allowed through so a first reading
-        // appears quickly instead of after a full interval.
-        let elapsed = now.duration_since(self.last_t);
+        // appears quickly instead of after a full interval. (Reached with a
+        // refresh not due only if the pid check above failed and the snapshot
+        // then found the same pid after all.)
         if !force && elapsed < self.stats_every && self.cur.cpu.is_some() {
             return (self.cur, false);
         }
@@ -237,19 +320,68 @@ impl Monitor {
         bytes as f64 / self.total_mem * 100.0
     }
 
-    /// Takes a `SystemProcessInformation` snapshot into `self.buf` (growing
-    /// it if `STATUS_INFO_LENGTH_MISMATCH` says so) and walks the entries.
-    /// Returns `(pid, kernel+user time in 100 ns units, working set bytes)`
-    /// of the first process whose image name matches, case-insensitively.
+    /// Whether `pid` still belongs to a process with the image name being
+    /// looked for. `SystemProcessIdInformation` returns that one name without
+    /// walking the process list, so this costs a few microseconds against
+    /// milliseconds for a snapshot. Also false when the query fails for any
+    /// reason (no such pid, or a name longer than the buffer, which no VM
+    /// process has); the caller then takes a snapshot, which settles it.
+    fn alive(&self, pid: usize) -> bool {
+        let Some(query) = self.nt_query else {
+            return false;
+        };
+        let mut name = [0u16; 260];
+        let mut info = SysProcIdInfo {
+            process_id: pid,
+            image_name: UnicodeString {
+                length: 0,
+                maximum_length: (name.len() * 2) as u16,
+                buffer: name.as_mut_ptr(),
+            },
+        };
+        let mut needed: u32 = 0;
+        let st = unsafe {
+            query(
+                SYSTEM_PROCESS_ID_INFORMATION,
+                (&mut info as *mut SysProcIdInfo).cast(),
+                std::mem::size_of::<SysProcIdInfo>() as u32,
+                &mut needed,
+            )
+        };
+        if st != 0 {
+            return false; // STATUS_INVALID_CID: no process with that id (any more)
+        }
+        let n = (info.image_name.length as usize / 2).min(name.len());
+        // Compare the last path component only: for a minimal process the
+        // name is bare, for others it is the NT path of the image.
+        let full = &name[..n];
+        let base = full
+            .rsplit(|&c| c == u16::from(b'\\'))
+            .next()
+            .unwrap_or(full);
+        eq_lowercase_utf16(base, &self.proc_name)
+    }
+
+    /// Takes a snapshot of the session-0 process list (into a buffer
+    /// allocated for the call and sized from the previous one, grown if
+    /// `STATUS_INFO_LENGTH_MISMATCH` says so) and walks the entries. Returns
+    /// `(pid, kernel+user time in 100 ns units, working set bytes)` of the
+    /// first process whose image name matches, case-insensitively.
     fn find(&mut self) -> Option<(usize, i64, u64)> {
         let query = self.nt_query?;
+        let mut buf = vec![0u8; self.snapshot_size];
         loop {
             let mut needed: u32 = 0;
+            let mut req = SysSessionProcInfo {
+                session_id: VM_SESSION,
+                size_of_buf: buf.len() as u32,
+                buffer: buf.as_mut_ptr().cast(),
+            };
             let st = unsafe {
                 query(
-                    SYSTEM_PROCESS_INFORMATION,
-                    self.buf.as_mut_ptr().cast(),
-                    self.buf.len() as u32,
+                    SYSTEM_SESSION_PROCESS_INFORMATION,
+                    (&mut req as *mut SysSessionProcInfo).cast(),
+                    std::mem::size_of::<SysSessionProcInfo>() as u32,
                     &mut needed,
                 )
             };
@@ -259,19 +391,23 @@ impl Monitor {
             if st != STATUS_INFO_LENGTH_MISMATCH {
                 return None;
             }
-            self.buf = vec![0; needed as usize + 64 * 1024];
+            // `needed` is the size that would have fitted; doubling as a floor
+            // guarantees progress even if it were left at zero.
+            let size = (needed as usize + SNAPSHOT_SLACK).max(buf.len() * 2);
+            buf = vec![0; size];
         }
+        self.snapshot_size = buf.len();
+        self.snapshots += 1;
 
         let mut off = 0usize;
         loop {
-            if off + std::mem::size_of::<SysProcInfo>() > self.buf.len() {
+            if off + std::mem::size_of::<SysProcInfo>() > buf.len() {
                 return None;
             }
             // SAFETY: the kernel filled buf with a chain of SYSTEM_PROCESS_INFORMATION
             // entries; each entry is at least size_of::<SysProcInfo>() bytes.
-            let p = unsafe {
-                std::ptr::read_unaligned(self.buf.as_ptr().add(off) as *const SysProcInfo)
-            };
+            let p =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const SysProcInfo) };
             if !p.image_name.is_null() && p.image_name_length > 0 {
                 let n = p.image_name_length as usize / 2;
                 // SAFETY: image_name points into buf (the kernel stores the string
@@ -418,10 +554,11 @@ mod tests {
     }
 
     /// Exercises the live sampler against whatever is running on this machine.
-    /// Uses an always-present process when the WSL2 VM is not running.
+    /// Uses an always-present session-0 process when the WSL2 VM is not
+    /// running.
     #[test]
     fn poll_live() {
-        for name in ["vmmemWSL", "explorer.exe"] {
+        for name in ["vmmemWSL", "services.exe"] {
             let mut m = Monitor::new(name, Duration::from_secs(30));
             let (st, changed) = m.poll(true);
             eprintln!("{name}: first poll -> {st:?} changed={changed}");
@@ -437,16 +574,53 @@ mod tests {
                 "expected a CPU measurement after forced second poll"
             );
             assert!(changed);
+            let before = m.snapshots();
             let (_, changed) = m.poll(false);
             assert!(
                 !changed,
                 "unforced poll within interval should not report a change"
             );
+            assert_eq!(
+                m.snapshots(),
+                before,
+                "a poll within the interval must not take a snapshot"
+            );
         }
     }
 
-    /// Cost of one presence check (the work done every `-poll` seconds).
-    /// Run with `cargo test --release -- --ignored --nocapture poll_cost`.
+    /// The pid check behind the fast path: a process that is always there,
+    /// a pid that never is, and a pid whose process has another name.
+    #[test]
+    fn alive_by_pid() {
+        let mut m = Monitor::new("services.exe", Duration::from_secs(30));
+        let (pid, _, _) = m.find().expect("services.exe is running");
+        assert!(m.alive(pid));
+        assert!(!m.alive(1 << 40), "no such pid");
+        assert!(!m.alive(4), "pid 4 is System, not services.exe");
+        assert!(
+            !Monitor::new("notepad.exe", Duration::from_secs(30)).alive(pid),
+            "right pid, wrong name"
+        );
+    }
+
+    /// A snapshot that starts with a buffer far too small grows it and
+    /// succeeds; the size is remembered for the next one.
+    #[test]
+    fn snapshot_grows() {
+        let mut m = Monitor::new("services.exe", Duration::from_secs(30));
+        m.snapshot_size = 64;
+        assert!(m.find().is_some());
+        assert!(m.snapshot_size > 64);
+        let grown = m.snapshot_size;
+        assert!(m.find().is_some());
+        assert_eq!(m.snapshot_size, grown, "no regrowth once it fits");
+        assert_eq!(m.snapshots(), 2);
+    }
+
+    /// Cost of a snapshot: what every `-poll` does while the VM is off and
+    /// every `-interval` while it runs (session 0, buffer allocated per call
+    /// as in `find`), and the full process list for comparison.
+    /// `cargo test --release -- --ignored --nocapture poll_cost`.
     #[test]
     #[ignore]
     fn poll_cost() {
@@ -457,12 +631,44 @@ mod tests {
         for _ in 0..n {
             m.find();
         }
-        let per = t.elapsed() / n;
+        let session = t.elapsed() / n;
+
+        let query = m.nt_query.unwrap();
+        let mut buf = vec![0u8; 4 << 20];
+        let mut needed = 0u32;
+        let t = Instant::now();
+        for _ in 0..n {
+            let st = unsafe {
+                query(
+                    SYSTEM_PROCESS_INFORMATION,
+                    buf.as_mut_ptr().cast(),
+                    buf.len() as u32,
+                    &mut needed,
+                )
+            };
+            assert_eq!(st, 0);
+        }
+        let full = t.elapsed() / n;
         eprintln!(
-            "poll_cost: {} process-list snapshots, {:?} each, buffer {} KB",
-            n,
-            per,
-            m.buf.len() / 1024
+            "poll_cost: session-0 snapshot {session:?} ({} KB buffer); \
+             full process list {full:?} ({} KB) for comparison",
+            m.snapshot_size / 1024,
+            needed / 1024
         );
+    }
+
+    /// Cost of the pid check done by the polls between two refreshes.
+    /// `cargo test --release -- --ignored --nocapture check_cost`.
+    #[test]
+    #[ignore]
+    fn check_cost() {
+        let mut m = Monitor::new("services.exe", Duration::from_secs(30));
+        let (pid, _, _) = m.find().unwrap();
+        let n = 20_000;
+        let t = Instant::now();
+        for _ in 0..n {
+            assert!(m.alive(pid));
+        }
+        eprintln!("check_cost: {n} pid checks, {:?} each", t.elapsed() / n);
     }
 }

@@ -109,7 +109,7 @@ wsl-tray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-render
 |---|---|---|
 | `-poll` | `5s` | How often to check whether the VM process exists. Cheap. |
 | `-interval` | `30s` | How often to refresh CPU and memory while the VM is running. |
-| `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. |
+| `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. It is looked for among the session-0 (service) processes only, which is where every VM process lives. |
 | `-log` | – | Append one line per poll and menu action to this file. |
 | `-render-test` | – | Write the icon in every state and size as PNGs to this directory, then exit. |
 
@@ -119,27 +119,30 @@ are written like `30s`, `1m30s` or `250ms`.
 ## Resource usage
 
 Measured on Windows 11 25H2, AMD Ryzen AI MAX+ 395 (32 logical cores, 48 GB),
-125 % display scaling, with the release build from this repository.
+125 % display scaling, with the release build from this repository, over
+two-minute windows at the default `-poll 5s -interval 30s`.
 
 | | |
 |---|---|
-| Executable | 282 KB (x64), 270 KB (ARM64) |
-| Private memory | 2.5 MB at start, 3.9 MB after half an hour |
-| Working set | 10 MB at start, ~19 MB once the menu and tooltip have been shown (shared theme and common-control DLLs) |
+| Executable | 289 KB (x64); the ARM64 build is about 12 KB smaller |
+| Private memory | 2.5 MB at start, 2.4 MB a few minutes later |
+| Working set | 10.5 MB at start, ~19 MB once the menu and tooltip have been shown (shared theme and common-control DLLs) |
 | Threads | 1 while idle; up to 3 more appear briefly for GDI and the thread pool, and one runs `wsl --shutdown` |
-| One presence check | 3.8 ms for a full process-list snapshot (~250 processes) |
-| Idle CPU | 1.1 ms of CPU per second over a 23-minute window with the VM running (0.11 % of one core, 0.003 % of the machine) |
+| One poll, VM running | 0.2 µs: the pid check. A session-0 snapshot only every `-interval` |
+| One poll, VM off | 0.4 ms: a session-0 process-list snapshot (~260 KB; the full list would be ~830 KB and 5–7 ms) |
+| Idle CPU | 0.26 ms of CPU per second with the VM running (0.026 % of one core) and 0.52 ms/s with it off; 0.5 and 1.9 million cycles per second. Before the session-0 snapshot and the pid check it was 1.95 and 2.08 ms/s. Most of what is left is the timer wake-up itself |
 
 The only dependency is [`windows-sys`](https://crates.io/crates/windows-sys),
-which contains nothing but `extern` declarations. There is no runtime, no COM,
-no allocation on the poll path beyond reusing one buffer.
+which contains nothing but `extern` declarations. There is no runtime and no
+COM; the poll path allocates nothing while the VM runs, and one buffer per
+snapshot otherwise.
 
 For comparison, the [original Go version](https://github.com/ideaconnect/wsl-tray/tree/80832856e8e4c4db82938dd60d8245e506c6db0a/legacy/go)
 of this program was a 2.4 MB executable using 16 MB of private memory and 8
 threads; the difference is the Go runtime.
 
-Measure it yourself: `cargo test --release -- --ignored --nocapture poll_cost`
-prints the per-poll cost on your machine.
+Measure it yourself: `cargo test --release -- --ignored --nocapture poll_cost
+check_cost` prints the snapshot and pid-check costs on your machine.
 
 ## How it works
 
@@ -147,12 +150,23 @@ prints the per-poll cost on your machine.
   presence is the on/off signal. `wsl --list --running` is not used because
   it says "no running distributions" while the VM is still alive and holding
   memory.
-- CPU and memory come from `NtQuerySystemInformation(SystemProcessInformation)`,
-  the call Task Manager uses. It needs no handle to the process, which matters
-  because `vmmemWSL` runs as SYSTEM and `OpenProcess` on it is denied to a
-  normal user. CPU is the difference in kernel+user time between two samples
-  divided by wall time and the number of logical cores; memory is the
-  process's working set.
+- CPU and memory come from `NtQuerySystemInformation`, the call Task Manager
+  uses. It needs no handle to the process, which matters because `vmmemWSL`
+  runs as SYSTEM and `OpenProcess` on it is denied to a normal user with any
+  access mask. The process list is requested for session 0 only
+  (`SystemSessionProcessInformation`): the VM is created by the WSL service,
+  so it is always there, and the session-0 list is about a tenth of the size
+  and cost of the full one. CPU is the difference in kernel+user time between
+  two samples divided by wall time and the number of logical cores; memory is
+  the process's working set.
+- While the VM is running, the polls between two `-interval` refreshes do not
+  take a snapshot at all: they ask the kernel for the name behind the VM's
+  pid (`SystemProcessIdInformation`, a few hundred nanoseconds), which also
+  catches the pid being reused by another process. The snapshot buffer is
+  allocated per snapshot and freed at once, so it is not resident in between.
+- The poll timer is a coalescable timer with a tolerance of 20 % of the
+  interval (at most a second), so Windows can batch its wake-up with other
+  timers instead of waking the CPU for it alone.
 - The icon is the Font Awesome "linux" glyph, rasterized once into a small
   coverage mask (`assets/tux.bin`, generated by `tools/gentux-rs`) and scaled
   to the taskbar's icon size at run time. No font is involved, so it looks the

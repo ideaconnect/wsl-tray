@@ -9,7 +9,7 @@
 //!    +-- create_window()      hidden top-level window; owns the tray icon,
 //!    |                        receives its callbacks and the poll timer
 //!    +-- add_tray_icon()      Shell_NotifyIconW(NIM_ADD), version 4
-//!    +-- SetTimer(-poll)      WM_TIMER every 5 s by default
+//!    +-- SetCoalescableTimer  WM_TIMER every -poll (5 s), up to 20 % late
 //!    +-- message loop         GetMessageW / DispatchMessageW until WM_QUIT
 //!
 //!  wnd_proc -> App::handle
@@ -83,11 +83,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, GetCursorPos, GetLastActivePopup, GetMessageW,
     GetSystemMetrics, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenuEx,
-    TranslateMessage, CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MSG, SM_CXSMICON, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSEXW,
+    RegisterClassExW, RegisterWindowMessageW, SetCoalescableTimer, SetForegroundWindow,
+    TrackPopupMenuEx, TranslateMessage, CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL,
+    WM_TIMER, WNDCLASSEXW,
 };
 
 use icon::Level;
@@ -459,7 +460,13 @@ fn main() {
         a.tick(true);
         a.add_tray_icon();
         a.promote_once();
-        unsafe { SetTimer(a.hwnd.get(), TIMER_POLL, opts.poll.as_millis() as u32, None) };
+        // A coalescable timer: Windows may fire it up to `tolerance` late so
+        // the wake-up can be batched with other timers on the machine, which
+        // is how a status icon should behave on battery. 20 % of the
+        // interval, at most a second.
+        let ms = opts.poll.as_millis() as u32;
+        let tolerance = (ms / 5).clamp(1, 1000);
+        unsafe { SetCoalescableTimer(a.hwnd.get(), TIMER_POLL, ms, None, tolerance) };
     });
 
     // Standard message loop. GetMessageW returns 0 on WM_QUIT and -1 on error;
@@ -602,11 +609,12 @@ impl App {
     fn tick(&self, force: bool) {
         let (st, changed) = self.mon.borrow_mut().poll(force);
         log!(
-            "poll force={force} -> running={} pid={} cpu={:.2} mem={} changed={changed}",
+            "poll force={force} -> running={} pid={} cpu={:.2} mem={} changed={changed} snapshots={}",
             st.running,
             st.pid,
             st.cpu.unwrap_or(-1.0),
-            format_bytes(st.mem)
+            format_bytes(st.mem),
+            self.mon.borrow().snapshots()
         );
         if !changed && !self.hicon.get().is_null() {
             return;
