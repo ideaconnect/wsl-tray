@@ -87,8 +87,8 @@ wsl-tray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-render
 | `-log` | – | Append one line per poll and menu action to this file. |
 | `-render-test` | – | Write the icon in every state and size as PNGs to this directory, then exit. |
 
-Flags follow Go conventions: `-poll 10s`, `-poll=10s` and `--poll 10s` all
-work. Durations are written like `30s`, `1m30s` or `250ms`.
+Flags can be written as `-poll 10s`, `-poll=10s` or `--poll 10s`. Durations
+are written like `30s`, `1m30s` or `250ms`.
 
 ## Resource usage
 
