@@ -32,35 +32,39 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 
 use crate::monitor::Status;
+use crate::settings::Settings;
 
 /// Colour of the icon, derived from a [`Status`].
 ///
 /// While the VM runs, the level follows the higher of its CPU and memory
-/// share of the host: green below 50 %, orange from 50 % to 75 %, red above
-/// 75 %. Grey means the VM is off.
+/// share of the host, compared with the two thresholds in [`Settings`]:
+/// green below `warn`, orange from `warn` up to and including `high`, red
+/// above `high` (50 % and 75 % unless changed in the settings dialog). Grey
+/// means the VM is off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {
     /// WSL2 is not running (grey).
     Off,
-    /// Running, load below 50 % (green).
+    /// Running, load below the orange threshold (green).
     Ok,
-    /// Load between 50 % and 75 % (orange).
+    /// Load from the orange threshold up to the red one (orange).
     Warn,
-    /// Load above 75 % (red).
+    /// Load above the red threshold (red).
     High,
 }
 
 impl Level {
-    /// Classifies a status. An unknown CPU reading (first sample after the
-    /// VM appeared) counts as 0 %, so memory alone decides until then.
-    pub fn for_status(st: &Status) -> Level {
+    /// Classifies a status against the thresholds in `s`. An unknown CPU
+    /// reading (first sample after the VM appeared) counts as 0 %, so memory
+    /// alone decides until then.
+    pub fn for_status(st: &Status, s: &Settings) -> Level {
         if !st.running {
             return Level::Off;
         }
         let load = st.cpu.unwrap_or(0.0).max(st.mem_pct);
-        if load > 75.0 {
+        if load > s.high as f64 {
             Level::High
-        } else if load >= 50.0 {
+        } else if load >= s.warn as f64 {
             Level::Warn
         } else {
             Level::Ok
@@ -365,21 +369,41 @@ mod tests {
             mem_pct: mem,
             ..Default::default()
         };
-        assert_eq!(Level::for_status(&Status::default()), Level::Off);
-        assert_eq!(Level::for_status(&st(10.0, 10.0)), Level::Ok);
-        assert_eq!(Level::for_status(&st(49.9, 0.0)), Level::Ok);
-        assert_eq!(Level::for_status(&st(50.0, 0.0)), Level::Warn);
-        assert_eq!(Level::for_status(&st(0.0, 75.0)), Level::Warn);
-        assert_eq!(Level::for_status(&st(0.0, 75.1)), Level::High);
+        let d = Settings::default();
+        assert_eq!(Level::for_status(&Status::default(), &d), Level::Off);
+        assert_eq!(Level::for_status(&st(10.0, 10.0), &d), Level::Ok);
+        assert_eq!(Level::for_status(&st(49.9, 0.0), &d), Level::Ok);
+        assert_eq!(Level::for_status(&st(50.0, 0.0), &d), Level::Warn);
+        assert_eq!(Level::for_status(&st(0.0, 75.0), &d), Level::Warn);
+        assert_eq!(Level::for_status(&st(0.0, 75.1), &d), Level::High);
         assert_eq!(
-            Level::for_status(&Status {
-                running: true,
-                cpu: None,
-                mem_pct: 80.0,
-                ..Default::default()
-            }),
+            Level::for_status(
+                &Status {
+                    running: true,
+                    cpu: None,
+                    mem_pct: 80.0,
+                    ..Default::default()
+                },
+                &d
+            ),
             Level::High
         );
+
+        // Custom thresholds, e.g. for a machine where .wslconfig caps the VM
+        // at a small share of the host.
+        let s = Settings { warn: 10, high: 12 };
+        assert_eq!(Level::for_status(&st(9.9, 0.0), &s), Level::Ok);
+        assert_eq!(Level::for_status(&st(10.0, 0.0), &s), Level::Warn);
+        assert_eq!(Level::for_status(&st(0.0, 12.0), &s), Level::Warn);
+        assert_eq!(Level::for_status(&st(12.5, 0.0), &s), Level::High);
+        // 100 / 100 all but switches the scale off: orange only at exactly
+        // 100 %, never red.
+        let off = Settings {
+            warn: 100,
+            high: 100,
+        };
+        assert_eq!(Level::for_status(&st(99.9, 99.9), &off), Level::Ok);
+        assert_eq!(Level::for_status(&st(100.0, 0.0), &off), Level::Warn);
     }
 
     #[test]

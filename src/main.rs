@@ -14,10 +14,14 @@
 //!
 //!  wnd_proc -> App::handle
 //!    WM_TIMER          -> tick(): Monitor::poll(), redraw icon/tooltip if changed
-//!    WM_TRAY_CALLBACK  -> show_menu() on click / keyboard select / context menu
+//!    WM_TRAY_CALLBACK  -> show_menu() on click / keyboard select / context menu,
+//!                         or bring the open settings dialog to the front
 //!    WM_REFRESH_NOW    -> tick(true), posted by the shutdown thread when done
 //!    TaskbarCreated    -> add_tray_icon() again after an Explorer restart
 //!    WM_DESTROY        -> remove the icon, PostQuitMessage
+//!
+//!  show_menu -> "Settings..." -> settings::edit() (modal dialog), then
+//!               Settings::save() and update_icon() with the new thresholds
 //! ```
 //!
 //! The modules split as follows:
@@ -26,6 +30,8 @@
 //!   It knows nothing about the UI.
 //! * [`icon`] turns a [`icon::Level`] (off / ok / warn / high) into an `HICON`
 //!   from the embedded Tux mask, and has the PNG writer used by `-render-test`.
+//! * [`settings`] holds the two colour thresholds, keeps them per user in the
+//!   registry (`HKCU\Software\IDCT\wsl-tray`) and owns the settings dialog.
 //! * this file: command line, window, tray icon, menu, registry (autostart and
 //!   the Windows 11 "show next to the clock" flag), diagnostics log.
 //!
@@ -37,16 +43,18 @@
 //!
 //! # Re-entrancy
 //!
-//! `TrackPopupMenuEx`, `MessageBoxW` and even `Shell_NotifyIconW` run a nested
-//! message loop, so `wnd_proc` can be entered again while one of them is on
-//! the stack. Application state therefore lives in [`App`] behind `Cell` /
-//! `RefCell`, and no `RefCell` borrow is ever held across a call that can pump
-//! messages. [`App::menu_open`] additionally stops a second menu from opening
-//! while the first one, or a dialog it launched, is still up.
+//! `TrackPopupMenuEx`, `MessageBoxW`, `DialogBoxIndirectParamW` and even
+//! `Shell_NotifyIconW` run a nested message loop, so `wnd_proc` can be entered
+//! again while one of them is on the stack. Application state therefore lives
+//! in [`App`] behind `Cell` / `RefCell`, and no `RefCell` borrow is ever held
+//! across a call that can pump messages. [`App::menu_open`] additionally stops
+//! a second menu from opening while the first one, or a dialog it launched, is
+//! still up; a tray click meanwhile brings that dialog to the front instead.
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
 mod icon;
 mod monitor;
+mod settings;
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::fs::File;
@@ -61,8 +69,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ,
+    REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{
@@ -71,17 +80,18 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KillTimer,
-    LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenuEx, TranslateMessage,
-    CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE,
-    WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSEXW,
+    DestroyWindow, DispatchMessageW, GetCursorPos, GetLastActivePopup, GetMessageW,
+    GetSystemMetrics, KillTimer, LoadCursorW, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenuEx,
+    TranslateMessage, CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
+    MSG, SM_CXSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
+    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSEXW,
 };
 
 use icon::Level;
 use monitor::{format_bytes, shutdown_wsl, Monitor, Status};
+use settings::Settings;
 
 /// Private message the shell sends to our window for tray-icon events
 /// (`NOTIFYICONDATAW::uCallbackMessage`). With `NOTIFYICON_VERSION_4` the
@@ -105,6 +115,7 @@ const IDM_SHUTDOWN: usize = 3;
 const IDM_REFRESH: usize = 4;
 const IDM_AUTOSTART: usize = 5;
 const IDM_EXIT: usize = 6;
+const IDM_SETTINGS: usize = 7;
 
 /// Window class of the hidden window. Also handy for finding the window from
 /// outside (`FindWindowW`) when automating tests.
@@ -329,6 +340,9 @@ struct App {
     taskbar_created: Cell<u32>,
     /// Colour level of `hicon`, to skip redundant re-renders.
     last_level: Cell<Option<Level>>,
+    /// The colour thresholds in effect: loaded at start, replaced when the
+    /// settings dialog is confirmed.
+    settings: Cell<Settings>,
     /// Windows 11 promotion (see [`promote_tray_icon`]) is done, or not
     /// applicable on this Windows version.
     promoted: Cell<bool>,
@@ -421,6 +435,7 @@ fn main() {
         menu_open: Cell::new(false),
         taskbar_created: Cell::new(0),
         last_level: Cell::new(None),
+        settings: Cell::new(Settings::load()),
         promoted: Cell::new(false),
         promote_tries: Cell::new(0),
         exe_path,
@@ -521,6 +536,17 @@ impl App {
                 // raw mouse messages also arrive and are deliberately ignored
                 // to avoid opening the menu twice.
                 match (lparam & 0xFFFF) as u32 {
+                    WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT if self.menu_open.get() => {
+                        // A command from the previous click is still running
+                        // with the settings dialog or a message box up: bring
+                        // that to the front rather than swallowing the click.
+                        // (The menu itself is never "active", so while it is
+                        // open this finds nothing and the click is ignored.)
+                        let popup = unsafe { GetLastActivePopup(hwnd) };
+                        if popup != hwnd {
+                            unsafe { SetForegroundWindow(popup) };
+                        }
+                    }
                     WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT => self.show_menu(),
                     _ => {}
                 }
@@ -591,8 +617,9 @@ impl App {
     /// created; the shell copies the icon during `NIM_MODIFY`, so destroying
     /// the old handle afterwards is safe.
     fn update_icon(&self, st: &Status) {
-        let lv = Level::for_status(st);
+        let lv = Level::for_status(st, &self.settings.get());
         if self.last_level.get() != Some(lv) || self.hicon.get().is_null() {
+            log!("icon -> {lv:?}");
             if let Ok((h, _)) = icon::render_icon(self.icon_size, lv, false) {
                 let old = self.hicon.replace(h);
                 if !old.is_null() {
@@ -670,6 +697,7 @@ impl App {
             add(MF_SEPARATOR, 0, "");
             let auto = MF_STRING | if autostart_enabled() { MF_CHECKED } else { 0 };
             add(auto, IDM_AUTOSTART, "Start with &Windows");
+            add(MF_STRING, IDM_SETTINGS, "S&ettings...");
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING, IDM_EXIT, "E&xit");
 
@@ -705,6 +733,7 @@ impl App {
                     message_box(self.hwnd.get(), &e, MB_ICONERROR);
                 }
             }
+            IDM_SETTINGS => self.show_settings(),
             IDM_EXIT => unsafe {
                 DestroyWindow(self.hwnd.get());
             },
@@ -740,6 +769,33 @@ impl App {
             }
             unsafe { PostMessageW(hwnd as HWND, WM_REFRESH_NOW, 0, 0) };
         });
+    }
+
+    /// "Settings...": edits the colour thresholds in the modal dialog, then
+    /// stores them and re-colours the icon straight away. If storing fails
+    /// the new values still apply until the program exits.
+    fn show_settings(&self) {
+        let mut s = self.settings.get();
+        match settings::edit(self.hwnd.get(), &mut s) {
+            Ok(true) => {
+                self.settings.set(s);
+                if let Err(e) = s.save() {
+                    message_box(
+                        self.hwnd.get(),
+                        &format!("{e}\n\nThe new thresholds apply until the program exits."),
+                        MB_ICONERROR,
+                    );
+                }
+                // Bound first: update_icon can pump messages, and a tick
+                // arriving then must not find the Monitor still borrowed.
+                let st = self.mon.borrow().current();
+                self.update_icon(&st);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                message_box(self.hwnd.get(), &e, MB_ICONERROR);
+            }
+        }
     }
 
     // ---- Windows 11 tray promotion ----
@@ -843,6 +899,29 @@ impl RegKey {
         Ok(RegKey(h))
     }
 
+    /// Opens `root\sub` for reading and writing, creating it (and any
+    /// missing parents) first if needed.
+    fn create(root: HKEY, sub: &str) -> Result<RegKey, String> {
+        let mut h: HKEY = null_mut();
+        let r = unsafe {
+            RegCreateKeyExW(
+                root,
+                wide(sub).as_ptr(),
+                0,
+                null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_READ | KEY_WRITE,
+                null(),
+                &mut h,
+                null_mut(),
+            )
+        };
+        if r != 0 {
+            return Err(format!("cannot create {sub} ({r})"));
+        }
+        Ok(RegKey(h))
+    }
+
     /// Reads a `REG_SZ` / `REG_EXPAND_SZ` value (unexpanded, up to 1023
     /// characters). `None` if absent or of another type.
     fn read_string(&self, name: &str) -> Option<String> {
@@ -920,9 +999,9 @@ impl RegKey {
         Ok(())
     }
 
-    /// Writes a `REG_DWORD` value; failure is ignored (best effort).
-    fn set_dword(&self, name: &str, value: u32) {
-        unsafe {
+    /// Writes a `REG_DWORD` value. Fails with the Win32 error code.
+    fn set_dword(&self, name: &str, value: u32) -> Result<(), u32> {
+        let r = unsafe {
             RegSetValueExW(
                 self.0,
                 wide(name).as_ptr(),
@@ -930,8 +1009,12 @@ impl RegKey {
                 REG_DWORD,
                 (&value as *const u32).cast(),
                 4,
-            );
+            )
+        };
+        if r != 0 {
+            return Err(r);
         }
+        Ok(())
     }
 
     /// Name of the `index`-th subkey, or `None` past the end (key names are
@@ -1012,7 +1095,8 @@ fn promote_tray_icon(exe: &str) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case(exe))
         {
             if k.read_dword("IsPromoted").is_none() {
-                k.set_dword("IsPromoted", 1);
+                // Best effort: if this fails the icon merely stays in the overflow.
+                let _ = k.set_dword("IsPromoted", 1);
             }
             return true;
         }

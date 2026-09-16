@@ -15,7 +15,8 @@ machine it is using.
 
 ![Icon states](docs/states.png)
 
-Left to right: off, running below 50 %, 50–75 %, above 75 %.
+Left to right: off, running below 50 %, 50–75 %, above 75 %. The two
+thresholds are the defaults; **Settings…** in the menu changes them.
 
 Percentages are relative to the whole machine (all logical cores, all physical
 RAM), the same way Task Manager reports `vmmemWSL`. The colour follows whichever
@@ -32,6 +33,30 @@ Click (left or right) for the menu:
 **Shut down WSL2** runs `wsl --shutdown` after asking for confirmation.
 **Start with Windows** adds or removes an entry under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
+## Settings
+
+**Settings…** in the menu opens a small dialog for the two thresholds at which
+the icon turns orange and red:
+
+![Settings dialog](docs/settings.png)
+
+Both are percentages of the whole machine, applied to whichever of CPU and
+memory is higher. Orange must not start above red; equal values are allowed,
+and 100 / 100 keeps the icon green whatever the load. **Restore defaults**
+puts back 50 / 75. The icon is recoloured as soon as you press OK.
+
+The values are stored per user in the registry under
+`HKCU\Software\IDCT\wsl-tray` (`WarnThreshold` and `HighThreshold`, both
+`REG_DWORD`); delete the key to go back to the defaults. Command-line flags
+are not involved, so a copy started by **Start with Windows** uses the same
+settings.
+
+This is a plain `HKEY_CURRENT_USER\Software\<company>\<product>` key, which
+also makes the program ready for the Microsoft Store: when it is packaged as
+MSIX, Windows redirects the package's `HKCU` writes into its private hive
+(`%LOCALAPPDATA%\Packages\<package family>\SystemAppData\Helium`), so the
+settings are private to the package and removed with it, with no code change.
 
 ## Download
 
@@ -133,6 +158,10 @@ prints the per-poll cost on your machine.
   same on every machine.
 - `wsl --shutdown` is started with `CreateProcessW` and an explicit
   `System32\wsl.exe` path, without a console window.
+- The settings dialog is a `DLGTEMPLATEEX` built in memory and shown with
+  `DialogBoxIndirectParamW`, so no resource compiler is needed and the dialog
+  manager handles fonts, DPI scaling and keyboard navigation. Its number
+  fields use the common-controls up-down spinner.
 
 ## Building
 
@@ -174,7 +203,11 @@ cargo run --release
 ### Tests and CI
 
 `cargo test --release` runs the unit tests, including one that samples live
-processes on the machine. The GitHub Actions workflow builds the Windows 11
+processes on the machine and one that writes to (and removes) a scratch key
+under `HKCU\Software\IDCT`. Two tests open the real settings dialog and are
+skipped by default: `cargo test --release -- --ignored dialog_roundtrip`
+drives it through window messages, `-- --ignored dialog_show` leaves it open
+for a look at the layout. The GitHub Actions workflow builds the Windows 11
 and Windows 10 variants for x64 and ARM64 on every push, runs the tests and
 clippy, and attaches all four executables to a release when a `v*` tag is
 pushed.
@@ -185,6 +218,7 @@ pushed.
 src/main.rs        window, tray icon, menu, autostart, Windows 11 promotion
 src/monitor.rs     process sampling, wsl --shutdown
 src/icon.rs        mask scaling, HICON creation, PNG output for -render-test
+src/settings.rs    colour thresholds: registry storage and the settings dialog
 assets/tux.bin     icon mask (generated)
 res/               resource objects; winres/ has their sources
 tools/gentux-rs/   mask generator
@@ -194,7 +228,9 @@ docs/              screenshots
 Each source file starts with a module comment that explains its part of the
 program (the message flow and re-entrancy rules in `main.rs`, why the
 process list is read the way it is in `monitor.rs`, the icon pipeline in
-`icon.rs`). `cargo doc --document-private-items --open` renders all of it.
+`icon.rs`, where the settings live and how the dialog is built without a
+resource compiler in `settings.rs`). `cargo doc --document-private-items
+--open` renders all of it.
 
 ## License
 
