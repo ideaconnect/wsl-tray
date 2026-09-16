@@ -38,11 +38,11 @@ use std::ptr::null;
 
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{DEFAULT_CHARSET, FW_NORMAL};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, KEY_READ};
 use windows_sys::Win32::UI::Controls::{
-    InitCommonControlsEx, EM_SETSEL, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, UDM_SETPOS32,
-    UDM_SETRANGE32, UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY, UDS_SETBUDDYINT,
+    EM_SETSEL, ICC_UPDOWN_CLASS, INITCOMMONCONTROLSEX, UDM_SETPOS32, UDM_SETRANGE32,
+    UDS_ALIGNRIGHT, UDS_ARROWKEYS, UDS_AUTOBUDDY, UDS_SETBUDDYINT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DialogBoxIndirectParamW, EndDialog, GetDlgItem, GetDlgItemInt, GetSystemMetrics,
@@ -147,8 +147,16 @@ pub fn edit(owner: HWND, s: &mut Settings) -> Result<bool, String> {
         dwICC: ICC_UPDOWN_CLASS,
     };
     let r = unsafe {
-        // Registers msctls_updown32; cheap to repeat.
-        InitCommonControlsEx(&icc);
+        // Registers msctls_updown32. comctl32 is loaded here rather than
+        // imported, so it joins the process only once the dialog is first
+        // opened; the tray icon and the menu do not need it. The library
+        // stays loaded afterwards, like an import would be.
+        let comctl = LoadLibraryW(wide("comctl32.dll").as_ptr());
+        if let Some(init) = GetProcAddress(comctl, c"InitCommonControlsEx".as_ptr().cast()) {
+            let init: unsafe extern "system" fn(*const INITCOMMONCONTROLSEX) -> i32 =
+                std::mem::transmute(init);
+            init(&icc);
+        }
         DialogBoxIndirectParamW(
             GetModuleHandleW(null()),
             tpl.as_ptr().cast(),
