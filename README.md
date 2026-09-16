@@ -32,7 +32,8 @@ Click (left or right) for the menu:
 
 **Shut down WSL2** runs `wsl --shutdown` after asking for confirmation.
 **Start with Windows** adds or removes an entry under
-`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. **Buy me a coffee**
+opens [buymeacoffee.com/idct](https://buymeacoffee.com/idct) in your browser.
 
 ## Settings
 

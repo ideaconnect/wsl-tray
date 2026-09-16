@@ -75,8 +75,9 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NINF_KEY, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD,
+    NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NINF_KEY, NIN_SELECT, NOTIFYICONDATAW,
+    NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
@@ -85,8 +86,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, TrackPopupMenuEx,
     TranslateMessage, CW_USEDEFAULT, HICON, IDC_ARROW, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_YESNO, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MSG, SM_CXSMICON, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
-    WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSEXW,
+    MSG, SM_CXSMICON, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_NULL, WM_TIMER, WNDCLASSEXW,
 };
 
 use icon::Level;
@@ -116,12 +117,15 @@ const IDM_REFRESH: usize = 4;
 const IDM_AUTOSTART: usize = 5;
 const IDM_EXIT: usize = 6;
 const IDM_SETTINGS: usize = 7;
+const IDM_COFFEE: usize = 8;
 
 /// Window class of the hidden window. Also handy for finding the window from
 /// outside (`FindWindowW`) when automating tests.
 const CLASS_NAME: &str = "WSLTrayWindow";
 /// Caption used for message boxes.
 const APP_TITLE: &str = "WSL2 Tray";
+/// Opened in the browser by "Buy me a coffee".
+const COFFEE_URL: &str = "https://buymeacoffee.com/idct";
 
 /// Per-user autostart key and the value name written there by
 /// "Start with Windows".
@@ -698,6 +702,7 @@ impl App {
             let auto = MF_STRING | if autostart_enabled() { MF_CHECKED } else { 0 };
             add(auto, IDM_AUTOSTART, "Start with &Windows");
             add(MF_STRING, IDM_SETTINGS, "S&ettings...");
+            add(MF_STRING, IDM_COFFEE, "Buy me a &coffee");
             add(MF_SEPARATOR, 0, "");
             add(MF_STRING, IDM_EXIT, "E&xit");
 
@@ -734,6 +739,11 @@ impl App {
                 }
             }
             IDM_SETTINGS => self.show_settings(),
+            IDM_COFFEE => {
+                if let Err(e) = open_url(self.hwnd.get(), COFFEE_URL) {
+                    message_box(self.hwnd.get(), &e, MB_ICONERROR);
+                }
+            }
             IDM_EXIT => unsafe {
                 DestroyWindow(self.hwnd.get());
             },
@@ -880,6 +890,26 @@ fn set_tip(nid: &mut NOTIFYICONDATAW, s: &str) {
     u.truncate(nid.szTip.len() - 1);
     nid.szTip.fill(0);
     nid.szTip[..u.len()].copy_from_slice(&u);
+}
+
+/// Opens `url` in the user's default browser through the shell's "open"
+/// verb, which resolves the `https` protocol association. Returns without
+/// waiting; `ShellExecuteW` reports failure with a value of 32 or less.
+fn open_url(hwnd: HWND, url: &str) -> Result<(), String> {
+    let r = unsafe {
+        ShellExecuteW(
+            hwnd,
+            wide("open").as_ptr(),
+            wide(url).as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if r as usize <= 32 {
+        return Err(format!("cannot open {url} (error {})", r as usize));
+    }
+    Ok(())
 }
 
 // ---- registry helpers ----
@@ -1169,6 +1199,14 @@ mod tests {
             r"C:\Tools\wsl-tray.exe"
         );
         assert_eq!(win32_path(r"\\?\Volume{1}\x.exe"), r"\\?\Volume{1}\x.exe");
+    }
+
+    /// Opens the sponsoring page in the browser, so it is not part of the
+    /// default run: `cargo test --release -- --ignored coffee_link`.
+    #[test]
+    #[ignore]
+    fn coffee_link() {
+        open_url(null_mut(), COFFEE_URL).unwrap();
     }
 
     #[test]
