@@ -36,17 +36,28 @@ Click (left or right) for the menu:
 ## Download
 
 <p align="center">
-  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-x64.exe"><img src="https://img.shields.io/badge/Download-AMD64-0078D4?style=for-the-badge" alt="Download AMD64"></a>
+  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win11-x64.exe"><img src="https://img.shields.io/badge/Windows_11-AMD64-0078D4?style=for-the-badge" alt="Download for Windows 11, AMD64"></a>
   &nbsp;&nbsp;
-  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-arm64.exe"><img src="https://img.shields.io/badge/Download-ARM64-0078D4?style=for-the-badge" alt="Download ARM64"></a>
+  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win11-arm64.exe"><img src="https://img.shields.io/badge/Windows_11-ARM64-0078D4?style=for-the-badge" alt="Download for Windows 11, ARM64"></a>
+</p>
+<p align="center">
+  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win10-x64.exe"><img src="https://img.shields.io/badge/Windows_10-AMD64-0078D4?style=for-the-badge" alt="Download for Windows 10, AMD64"></a>
+  &nbsp;&nbsp;
+  <a href="https://github.com/ideaconnect/wsl-tray/releases/latest/download/wsl-tray-win10-arm64.exe"><img src="https://img.shields.io/badge/Windows_10-ARM64-0078D4?style=for-the-badge" alt="Download for Windows 10, ARM64"></a>
 </p>
 
 The buttons always fetch the latest release. Each
-[release](https://github.com/ideaconnect/wsl-tray/releases) has
-`wsl-tray-x64.exe` and `wsl-tray-arm64.exe` attached, with a `SHA256SUMS`
+[release](https://github.com/ideaconnect/wsl-tray/releases) has four
+executables attached, `wsl-tray-win11-x64.exe`, `wsl-tray-win11-arm64.exe`,
+`wsl-tray-win10-x64.exe` and `wsl-tray-win10-arm64.exe`, with a `SHA256SUMS`
 file. There is nothing to install: put the file somewhere permanent, run it,
 and tick **Start with Windows** in the menu if you want it back after a
 reboot. It does not need administrator rights.
+
+The Windows 11 and Windows 10 builds differ in one thing only: the name of
+the VM process they look for, `vmmemWSL` or `vmmem`. If the icon stays grey
+while a distribution is running, look the process up in Task Manager
+(Details tab) and take the other build, or pass the name with `-process`.
 
 On Windows 11 the icon shows up next to the clock on first run (the app sets
 its own `IsPromoted` flag in `HKCU\Control Panel\NotifyIconSettings`, but only
@@ -72,7 +83,7 @@ wsl-tray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-render
 |---|---|---|
 | `-poll` | `5s` | How often to check whether the VM process exists. Cheap. |
 | `-interval` | `30s` | How often to refresh CPU and memory while the VM is running. |
-| `-process` | `vmmemWSL` | Name of the VM process. Older Windows 10 builds call it `vmmem`. |
+| `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. |
 | `-log` | – | Append one line per poll and menu action to this file. |
 | `-render-test` | – | Write the icon in every state and size as PNGs to this directory, then exit. |
 
@@ -106,9 +117,10 @@ prints the per-poll cost on your machine.
 
 ## How it works
 
-- The VM shows up as a process called `vmmemWSL`. Its presence is the on/off
-  signal. `wsl --list --running` is not used because it says "no running
-  distributions" while the VM is still alive and holding memory.
+- The VM shows up as a process called `vmmemWSL` (`vmmem` on Windows 10). Its
+  presence is the on/off signal. `wsl --list --running` is not used because
+  it says "no running distributions" while the VM is still alive and holding
+  memory.
 - CPU and memory come from `NtQuerySystemInformation(SystemProcessInformation)`,
   the call Task Manager uses. It needs no handle to the process, which matters
   because `vmmemWSL` runs as SYSTEM and `OpenProcess` on it is denied to a
@@ -135,6 +147,10 @@ Run that copy rather than the one under `target\`: Windows refuses to
 overwrite a running executable, so running from `target\release` makes the
 next build fail while the tray app is open.
 
+`.\build.ps1 -Win10` (or `cargo build --release --features win10`) builds the
+Windows 10 variant. The `win10` feature does nothing but change the default of
+`-process` from `vmmemWSL` to `vmmem`.
+
 The exe icon, the application manifest (per-monitor DPI, common controls v6)
 and the version resource are linked from pre-built objects in `res\` (one per
 architecture), so `rc.exe` is not needed. To regenerate them after editing
@@ -158,9 +174,10 @@ cargo run --release
 ### Tests and CI
 
 `cargo test --release` runs the unit tests, including one that samples live
-processes on the machine. The GitHub Actions workflow builds x64 and ARM64 on
-every push, runs the tests and clippy, and attaches both executables to a
-release when a `v*` tag is pushed.
+processes on the machine. The GitHub Actions workflow builds the Windows 11
+and Windows 10 variants for x64 and ARM64 on every push, runs the tests and
+clippy, and attaches all four executables to a release when a `v*` tag is
+pushed.
 
 ### Layout
 

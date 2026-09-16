@@ -22,6 +22,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[features]
+# Windows 10 variant: the WSL2 VM process is called `vmmem` there instead of
+# `vmmemWSL`, so this changes the default of -process. Nothing else differs.
+win10 = []
+
 [profile.release]
 opt-level = "s"
 lto = true

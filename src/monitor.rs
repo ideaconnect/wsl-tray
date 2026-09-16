@@ -4,10 +4,10 @@
 //!
 //! WSL2 runs all distributions inside one lightweight Hyper-V VM whose memory
 //! and CPU time Windows accounts to a placeholder process, `vmmemWSL`
-//! (`vmmem` on older Windows 10 builds). Its existence is the most reliable
-//! "is WSL2 on" signal: `wsl --list --running` reports no running
-//! distributions while the VM is still alive and holding memory (the VM
-//! lingers for `vmIdleTimeout` after the last distribution exits).
+//! (`vmmem` on Windows 10). Its existence is the most reliable "is WSL2 on"
+//! signal: `wsl --list --running` reports no running distributions while the
+//! VM is still alive and holding memory (the VM lingers for `vmIdleTimeout`
+//! after the last distribution exits).
 //!
 //! The VM process runs as SYSTEM, so `OpenProcess` on it fails for a normal
 //! user and `GetProcessTimes` / `GetProcessMemoryInfo` are out.

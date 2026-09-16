@@ -35,8 +35,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --release --all-targets --target ${{ matrix.target }} -- -D warnings
 
-      - name: Build
-        run: cargo build --locked --release --target ${{ matrix.target }}
+      # Two executables per architecture, differing only in the default name of
+      # the WSL2 VM process: vmmemWSL on Windows 11, vmmem on Windows 10 (the
+      # `win10` feature). Both builds write the same file, so each one is copied
+      # to dist/ under its release name before the next one runs.
+      - name: Build (Windows 11)
+        shell: bash
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/wsl-tray.exe dist/wsl-tray-win11-${{ matrix.arch }}.exe
+
+      - name: Build (Windows 10)
+        shell: bash
+        run: |
+          cargo build --locked --release --target ${{ matrix.target }} --features win10
+          cp target/${{ matrix.target }}/release/wsl-tray.exe dist/wsl-tray-win10-${{ matrix.arch }}.exe
 
       - name: Test
         if: matrix.arch == 'x64'
@@ -60,13 +74,12 @@ jobs:
       - name: Report size
         shell: pwsh
         run: |
-          $exe = Get-Item "target/${{ matrix.target }}/release/wsl-tray.exe"
-          "wsl-tray.exe (${{ matrix.arch }}): $($exe.Length) bytes" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          Get-ChildItem dist/*.exe | ForEach-Object { "$($_.Name): $($_.Length) bytes" } | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
 
       - uses: actions/upload-artifact@v4
         with:
           name: wsl-tray-${{ matrix.arch }}
-          path: target/${{ matrix.target }}/release/wsl-tray.exe
+          path: dist/*.exe
           if-no-files-found: error
 
   release:
@@ -79,19 +92,33 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          merge-multiple: true
 
-      - name: Name the binaries
+      - name: Checksums
+        working-directory: dist
         run: |
-          mv dist/wsl-tray-x64/wsl-tray.exe dist/wsl-tray-x64.exe
-          mv dist/wsl-tray-arm64/wsl-tray.exe dist/wsl-tray-arm64.exe
-          (cd dist && sha256sum wsl-tray-x64.exe wsl-tray-arm64.exe > SHA256SUMS)
+          sha256sum wsl-tray-win11-x64.exe wsl-tray-win11-arm64.exe \
+                    wsl-tray-win10-x64.exe wsl-tray-win10-arm64.exe > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat > notes.md <<'MD'
+          | Download | AMD64 | ARM64 |
+          |---|---|---|
+          | Windows 11 (VM process `vmmemWSL`) | `wsl-tray-win11-x64.exe` | `wsl-tray-win11-arm64.exe` |
+          | Windows 10 (VM process `vmmem`) | `wsl-tray-win10-x64.exe` | `wsl-tray-win10-arm64.exe` |
+
+          The two variants differ only in the default of `-process`. If the icon stays grey while WSL2 is running, check the process name in Task Manager and take the other one.
+
+          MD
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --title "wsl-tray $GITHUB_REF_NAME" \
+            --notes-file notes.md \
             --generate-notes \
-            dist/wsl-tray-x64.exe dist/wsl-tray-arm64.exe dist/SHA256SUMS
+            dist/wsl-tray-win11-x64.exe dist/wsl-tray-win11-arm64.exe \
+            dist/wsl-tray-win10-x64.exe dist/wsl-tray-win10-arm64.exe \
+            dist/SHA256SUMS

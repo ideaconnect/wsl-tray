@@ -128,7 +128,7 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 // ---- command line ----
 
-/// Parsed command line. Defaults are documented in [`USAGE`].
+/// Parsed command line. Defaults are documented in [`usage`].
 struct Options {
     /// Interval of the presence check (`-poll`).
     poll: Duration,
@@ -142,14 +142,28 @@ struct Options {
     render_test: Option<String>,
 }
 
-const USAGE: &str =
-    "wsl-tray [--poll 5s] [--interval 30s] [--process vmmemWSL] [--log FILE] [--render-test DIR]
+/// Default image name of the WSL2 VM process. Windows 11 calls it `vmmemWSL`;
+/// the `win10` Cargo feature builds the Windows 10 variant, where it is
+/// `vmmem`. Either build can be pointed at the other name with `-process`.
+const DEFAULT_PROCESS: &str = if cfg!(feature = "win10") {
+    "vmmem"
+} else {
+    "vmmemWSL"
+};
+
+/// Help text for `-h` and flag errors. A function rather than a constant only
+/// because the `--process` default is chosen per build.
+fn usage() -> String {
+    format!(
+        "wsl-tray [--poll 5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--render-test DIR]
 
   --poll         how often to check whether WSL2 is running (cheap)
   --interval     how often to refresh CPU/memory while WSL2 is running
   --process      name of the WSL2 VM process
   --log          append diagnostic log lines to this file
-  --render-test  write sample icon PNGs to this directory and exit";
+  --render-test  write sample icon PNGs to this directory and exit"
+    )
+}
 
 /// Go `time.ParseDuration` grammar: "0", or a sequence of `<number><unit>`
 /// terms such as "1m30s" or "1.5h" with units ns/us/µs/ms/s/m/h. A unit-less
@@ -198,7 +212,7 @@ fn parse_args() -> Result<Option<Options>, String> {
     let mut o = Options {
         poll: Duration::from_secs(5),
         stats: Duration::from_secs(30),
-        process: "vmmemWSL".into(),
+        process: DEFAULT_PROCESS.into(),
         log: None,
         render_test: None,
     };
@@ -209,7 +223,7 @@ fn parse_args() -> Result<Option<Options>, String> {
         }
         let name = a.strip_prefix("--").unwrap_or(&a[1..]);
         if name.starts_with(['-', '=']) {
-            return Err(format!("bad flag syntax: {a}\n\n{USAGE}"));
+            return Err(format!("bad flag syntax: {a}\n\n{}", usage()));
         }
         let (key, mut inline) = match name.split_once('=') {
             Some((k, v)) => (k, Some(v.to_string())),
@@ -219,7 +233,7 @@ fn parse_args() -> Result<Option<Options>, String> {
             inline
                 .take()
                 .or_else(|| it.next())
-                .ok_or_else(|| format!("missing value for --{key}\n\n{USAGE}"))
+                .ok_or_else(|| format!("missing value for --{key}\n\n{}", usage()))
         };
         match key {
             "poll" => o.poll = parse_duration(&value()?).ok_or("bad --poll duration")?,
@@ -228,7 +242,7 @@ fn parse_args() -> Result<Option<Options>, String> {
             "log" => o.log = Some(value()?),
             "render-test" => o.render_test = Some(value()?),
             "h" | "help" => return Ok(None),
-            _ => return Err(format!("unknown flag: {a}\n\n{USAGE}")),
+            _ => return Err(format!("unknown flag: {a}\n\n{}", usage())),
         }
     }
     Ok(Some(o))
@@ -349,7 +363,7 @@ fn main() {
     let opts = match parse_args() {
         Ok(Some(o)) => o,
         Ok(None) => {
-            message_box(null_mut(), USAGE, MB_ICONINFORMATION);
+            message_box(null_mut(), &usage(), MB_ICONINFORMATION);
             return;
         }
         Err(e) => {
