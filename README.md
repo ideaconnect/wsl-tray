@@ -31,6 +31,7 @@ Click (left or right) for the menu:
 ![Menu](docs/menu.png)
 
 **Shut down WSL2** runs `wsl --shutdown` after asking for confirmation.
+**Refresh now** re-reads the numbers without waiting for the next interval.
 **Start with Windows** adds or removes an entry under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. **Buy me a coffee**
 opens [buymeacoffee.com/idct](https://buymeacoffee.com/idct) in your browser.
@@ -126,7 +127,7 @@ two-minute windows at the default `-poll 5s -interval 30s`.
 |---|---|
 | Executable | 289 KB (x64); the ARM64 build is about 12 KB smaller |
 | Private memory | 2.5 MB at start, 2.4 MB a few minutes later |
-| Working set | 10.5 MB at start, ~19 MB once the menu and tooltip have been shown (shared theme and common-control DLLs) |
+| Working set | 10 MB at start, 17 MB once the menu has been shown and 19 MB after the settings dialog (shared theme and common-control DLLs) |
 | Threads | 1 while idle; up to 3 more appear briefly for GDI and the thread pool, and one runs `wsl --shutdown` |
 | One poll, VM running | 0.2 µs: the pid check. A session-0 snapshot only every `-interval` |
 | One poll, VM off | 0.4 ms: a session-0 process-list snapshot (~260 KB; the full list would be ~830 KB and 5–7 ms) |
@@ -217,15 +218,16 @@ cargo run --release
 
 ### Tests and CI
 
-`cargo test --release` runs the unit tests, including one that samples live
-processes on the machine and one that writes to (and removes) a scratch key
-under `HKCU\Software\IDCT`. Two tests open the real settings dialog and are
-skipped by default: `cargo test --release -- --ignored dialog_roundtrip`
-drives it through window messages, `-- --ignored dialog_show` leaves it open
-for a look at the layout. The GitHub Actions workflow builds the Windows 11
-and Windows 10 variants for x64 and ARM64 on every push, runs the tests and
-clippy, and attaches all four executables to a release when a `v*` tag is
-pushed.
+`cargo test --release` runs the unit tests, including ones that sample live
+session-0 processes on the machine and one that writes to (and removes) a
+scratch key under `HKCU\Software\IDCT`. Tests that open something are skipped
+unless asked for with `-- --ignored <name>`: `dialog_roundtrip` drives the
+real settings dialog through window messages, `dialog_show` leaves it open for
+a look at the layout, `coffee_link` opens the sponsoring page, and the
+benchmarks `poll_cost` and `check_cost` print timings. The GitHub Actions
+workflow builds the Windows 11 and Windows 10 variants for x64 and ARM64 on
+every push, runs the tests and clippy, and attaches all four executables to a
+release when a `v*` tag is pushed.
 
 ### Layout
 
