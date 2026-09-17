@@ -9,13 +9,15 @@
 //!    +-- create_window()      hidden top-level window; owns the tray icon,
 //!    |                        receives its callbacks and the poll timer
 //!    +-- add_tray_icon()      Shell_NotifyIconW(NIM_ADD), version 4
-//!    +-- SetCoalescableTimer  WM_TIMER every -poll (5 s), up to 20 % late
+//!    +-- SetCoalescableTimer  WM_TIMER every -poll (7.5 s), up to 1 s late
 //!    +-- message loop         GetMessageW / DispatchMessageW until WM_QUIT
 //!
 //!  wnd_proc -> App::handle
-//!    WM_TIMER          -> tick(): Monitor::poll(), redraw icon/tooltip if changed
-//!    WM_TRAY_CALLBACK  -> show_menu() on click / keyboard select / context menu,
-//!                         or bring the open settings dialog to the front
+//!    WM_TIMER          -> tick(): Monitor::poll(), redraw icon/tooltip if changed;
+//!                         relaxed (fewer snapshots) after 2 min without input
+//!    WM_TRAY_CALLBACK  -> show_menu() on click / keyboard select / context menu
+//!                         (after a fresh sample), or bring the open settings
+//!                         dialog to the front
 //!    WM_REFRESH_NOW    -> tick(true), posted by the shutdown thread when done
 //!    TaskbarCreated    -> add_tray_icon() again after an Explorer restart
 //!    WM_DESTROY        -> remove the icon, PostQuitMessage
@@ -73,7 +75,9 @@ use windows_sys::Win32::System::Registry::{
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_EXPAND_SZ,
     REG_OPTION_NON_VOLATILE, REG_SZ,
 };
+use windows_sys::Win32::System::SystemInformation::GetTickCount;
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NINF_KEY, NIN_SELECT, NOTIFYICONDATAW,
@@ -171,7 +175,7 @@ const DEFAULT_PROCESS: &str = if cfg!(feature = "win10") {
 /// because the `--process` default is chosen per build.
 fn usage() -> String {
     format!(
-        "wsl-tray [--poll 5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--render-test DIR]
+        "wsl-tray [--poll 7.5s] [--interval 30s] [--process {DEFAULT_PROCESS}] [--log FILE] [--render-test DIR]
 
   --poll         how often to check whether WSL2 is running (cheap)
   --interval     how often to refresh CPU/memory while WSL2 is running
@@ -226,7 +230,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
 /// `Ok(None)` means `-h`/`-help` was given.
 fn parse_args() -> Result<Option<Options>, String> {
     let mut o = Options {
-        poll: Duration::from_secs(5),
+        poll: Duration::from_millis(7500),
         stats: Duration::from_secs(30),
         process: DEFAULT_PROCESS.into(),
         log: None,
@@ -301,6 +305,24 @@ fn local_time() -> SYSTEMTIME {
     let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
     unsafe { GetLocalTime(&mut t) };
     t
+}
+
+/// Without keyboard or mouse input in this session for this long, nobody is
+/// looking at the icon and polling relaxes (see [`Monitor::poll`]).
+const IDLE_AFTER_MS: u32 = 120_000;
+
+/// Whether the session has seen no input for [`IDLE_AFTER_MS`]. Tick counts
+/// wrap every 49 days; wrapping subtraction keeps the difference right
+/// across that. A failed query counts as "someone is there".
+fn user_idle() -> bool {
+    let mut lii = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut lii) } == 0 {
+        return false;
+    }
+    unsafe { GetTickCount() }.wrapping_sub(lii.dwTime) >= IDLE_AFTER_MS
 }
 
 /// `MessageBoxW` with the application title. Returns the button id (`IDYES`
@@ -559,6 +581,8 @@ impl App {
                         }
                     }
                     WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT => self.show_menu(),
+                    // (No refresh on hover: with the standard tooltip,
+                    // NIF_SHOWTIP, the shell sends no NIN_POPUPOPEN.)
                     _ => {}
                 }
                 Some(0)
@@ -607,9 +631,10 @@ impl App {
     /// anything visible changed (or the icon does not exist yet), updates
     /// the icon and tooltip. `force` bypasses the stats interval.
     fn tick(&self, force: bool) {
-        let (st, changed) = self.mon.borrow_mut().poll(force);
+        let relaxed = !force && user_idle();
+        let (st, changed) = self.mon.borrow_mut().poll(force, relaxed);
         log!(
-            "poll force={force} -> running={} pid={} cpu={:.2} mem={} changed={changed} snapshots={}",
+            "poll force={force} relaxed={relaxed} -> running={} pid={} cpu={:.2} mem={} changed={changed} snapshots={}",
             st.running,
             st.pid,
             st.cpu.unwrap_or(-1.0),
@@ -681,6 +706,9 @@ impl App {
         if self.menu_open.replace(true) {
             return;
         }
+        // Sample now, so the status lines show the present rather than the
+        // last interval (one snapshot per click).
+        self.tick(true);
         let st = self.mon.borrow().current();
         let cmd = unsafe {
             let menu = CreatePopupMenu();
@@ -1215,6 +1243,20 @@ mod tests {
     #[ignore]
     fn coffee_link() {
         open_url(null_mut(), COFFEE_URL).unwrap();
+    }
+
+    /// `GetLastInputInfo` answers (the test session had input at some point
+    /// in the last two days), and the idle decision is consistent with it.
+    #[test]
+    fn idle_query_works() {
+        let mut lii = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        assert_ne!(unsafe { GetLastInputInfo(&mut lii) }, 0);
+        let idle_ms = unsafe { GetTickCount() }.wrapping_sub(lii.dwTime);
+        assert!(idle_ms < 2 * 24 * 3600 * 1000, "idle for {idle_ms} ms?");
+        assert_eq!(user_idle(), idle_ms >= IDLE_AFTER_MS);
     }
 
     #[test]

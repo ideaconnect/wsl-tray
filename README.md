@@ -103,12 +103,12 @@ If wsl-tray is useful to you, you can support its development:
 ## Command line
 
 ```
-wsl-tray.exe [-poll 5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-render-test DIR]
+wsl-tray.exe [-poll 7.5s] [-interval 30s] [-process vmmemWSL] [-log FILE] [-render-test DIR]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-poll` | `5s` | How often to check whether the VM process exists. Cheap. |
+| `-poll` | `7.5s` | How often to check whether the VM process exists: a pid lookup while it runs, a session-0 process list while it is off. |
 | `-interval` | `30s` | How often to refresh CPU and memory while the VM is running. |
 | `-process` | `vmmemWSL` (Windows 11 build), `vmmem` (Windows 10 build) | Name of the VM process. It is looked for among the session-0 (service) processes only, which is where every VM process lives. |
 | `-log` | – | Append one line per poll and menu action to this file. |
@@ -121,17 +121,18 @@ are written like `30s`, `1m30s` or `250ms`.
 
 Measured on Windows 11 25H2, AMD Ryzen AI MAX+ 395 (32 logical cores, 48 GB),
 125 % display scaling, with the release build from this repository, over
-two-minute windows at the default `-poll 5s -interval 30s`.
+two-minute windows at the default `-poll 7.5s -interval 30s`.
 
 | | |
 |---|---|
 | Executable | 289 KB (x64); the ARM64 build is about 12 KB smaller |
-| Private memory | 2.5 MB at start, 2.4 MB a few minutes later |
+| Private memory | 1.4 MB, whether the VM is off or running; about 1 MB more once the menu has been shown (theme resources) |
 | Working set | 10 MB at start, 17 MB once the menu has been shown and 19 MB after the settings dialog (shared theme and common-control DLLs) |
 | Threads | 1 while idle; up to 3 more appear briefly for GDI and the thread pool, and one runs `wsl --shutdown` |
-| One poll, VM running | 0.2 µs: the pid check. A session-0 snapshot only every `-interval` |
-| One poll, VM off | 0.4 ms: a session-0 process-list snapshot (~260 KB; the full list would be ~830 KB and 5–7 ms) |
-| Idle CPU | 0.26 ms of CPU per second with the VM running (0.026 % of one core) and 0.52 ms/s with it off; 0.5 and 1.9 million cycles per second. Before the session-0 snapshot and the pid check it was 1.95 and 2.08 ms/s. Most of what is left is the timer wake-up itself |
+| One poll, VM running | 0.2 µs: the pid check, plus the timer wake-up (about 0.2 million cycles). A session-0 snapshot only every `-interval` |
+| One poll, VM off | A session-0 process-list snapshot: on this machine 130 processes with 2 261 threads, ~260 KB. About 2 million cycles back to back, about 8 million after any pause of 100 ms or more, because the kernel then walks ~2 400 process and thread structures that are no longer in the caches (the full list would be ~830 KB and 2.5× that) |
+| Idle CPU, someone at the machine | 1.0 million cycles per second (0.4 ms/s, 0.03 % of one core) with the VM off; about 0.3 million with it running (16 wake-ups and 4 refresh snapshots per two minutes). v1.2.0 needed 4.7 million in both states |
+| Idle CPU, nobody at the machine | after two minutes without input: 0.09 million cycles per second measured with the VM running (0.13 ms/s), about 0.3 million with it off (one snapshot per 30 s) |
 
 The only dependency is [`windows-sys`](https://crates.io/crates/windows-sys),
 which contains nothing but `extern` declarations. There is no runtime and no
@@ -164,7 +165,18 @@ check_cost` prints the snapshot and pid-check costs on your machine.
   take a snapshot at all: they ask the kernel for the name behind the VM's
   pid (`SystemProcessIdInformation`, a few hundred nanoseconds), which also
   catches the pid being reused by another process. The snapshot buffer is
-  allocated per snapshot and freed at once, so it is not resident in between.
+  committed with `VirtualAlloc` per snapshot and released at once, so it is
+  not part of the process's memory in between.
+- After two minutes without keyboard or mouse input (`GetLastInputInfo`)
+  nobody is looking at the icon, so polling relaxes: while the VM is off it
+  is looked for every 30 s instead of every `-poll`, and while it runs the
+  numbers are refreshed every 120 s instead of every `-interval`. The pid
+  check keeps its cadence, so a stop is still noticed at the next poll, and
+  the first poll after you touch the machine is a normal one again.
+- Opening the menu takes a fresh sample first, so its status lines are current
+  whatever the interval. (The tooltip cannot do the same: with the standard
+  tooltip the shell gives no notice before showing it, so it shows the last
+  sample and says when that was taken.)
 - The poll timer is a coalescable timer with a tolerance of 20 % of the
   interval (at most a second), so Windows can batch its wake-up with other
   timers instead of waking the CPU for it alone.

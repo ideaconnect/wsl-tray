@@ -44,9 +44,20 @@
 //! two `-interval` refreshes only check the name behind its pid, and take a
 //! snapshot again only when the pid is gone or has changed hands, or when
 //! the CPU/memory numbers are due. The snapshot buffer is allocated for each
-//! snapshot and freed right after, sized from the previous one, so it is not
-//! part of the process's memory between polls (the allocation costs under a
-//! percent of the snapshot).
+//! snapshot with `VirtualAlloc` and released right after, sized from the
+//! previous one, so it is not part of the process's memory between polls
+//! (the allocation costs under a percent of the snapshot).
+//!
+//! A session-0 snapshot costs about 2 million cycles when nothing ran in
+//! between, but about 8 million after a pause of 100 ms or more: the kernel
+//! walks some 130 processes and 2 000+ threads whose structures are then no
+//! longer in the caches (`snapshot_cold_cost` measures this). There is no
+//! unprivileged event that says "a process appeared", and no query that
+//! returns names without the threads. So the caller also tells `poll`
+//! when nobody has touched the machine for a while (`relaxed`): then the
+//! VM is looked for every [`RELAXED_DISCOVERY`] instead of every poll and
+//! the numbers are refreshed every [`RELAXED_STATS`], which nobody sees,
+//! while the cheap pid check keeps running so a stop is noticed as before.
 
 use std::ffi::c_void;
 use std::ptr::null;
@@ -54,6 +65,9 @@ use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, SYSTEMTIME};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows_sys::Win32::System::Memory::{
+    VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+};
 use windows_sys::Win32::System::SystemInformation::{
     GetLocalTime, GetSystemDirectoryW, GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX,
     SYSTEM_INFO,
@@ -108,6 +122,9 @@ pub struct Monitor {
     snapshot_size: usize,
     /// Snapshots taken so far, see [`snapshots`](Self::snapshots).
     snapshots: u32,
+    /// When the last snapshot was taken (`None` before the first), for the
+    /// relaxed discovery cadence.
+    last_snapshot: Option<Instant>,
     /// `ntdll!NtQuerySystemInformation`, or `None` if it could not be found
     /// (then the VM is reported as not running).
     nt_query: Option<NtQuerySystemInformationFn>,
@@ -143,6 +160,38 @@ const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004_u32 as i32;
 /// Slack added to the size the last snapshot needed, for processes started
 /// since; a snapshot that still does not fit is retried with the new size.
 const SNAPSHOT_SLACK: usize = 64 * 1024;
+
+/// Cadence of a *relaxed* poll (nobody at the machine, see
+/// [`Monitor::poll`]): how often to look for the VM while it is off, and
+/// how often to refresh the numbers while it runs (or `-interval` if that
+/// is longer). Cheap checks are not affected by relaxing.
+pub const RELAXED_DISCOVERY: Duration = Duration::from_secs(30);
+pub const RELAXED_STATS: Duration = Duration::from_secs(120);
+
+/// Memory for one snapshot: committed with `VirtualAlloc` and released on
+/// drop, so it goes back to the OS at once. A heap allocation of this size
+/// (under the heap's 512 KB direct-allocation threshold) would stay
+/// committed in the heap's free lists between polls.
+struct Pages {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl Pages {
+    fn new(len: usize) -> Option<Pages> {
+        let ptr = unsafe { VirtualAlloc(null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        (!ptr.is_null()).then(|| Pages {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        unsafe { VirtualFree(self.ptr.cast(), 0, MEM_RELEASE) };
+    }
+}
 
 /// `UNICODE_STRING`: a counted UTF-16 string, lengths in bytes.
 #[repr(C)]
@@ -218,6 +267,7 @@ impl Monitor {
             last_pid: 0,
             snapshot_size: 256 * 1024,
             snapshots: 0,
+            last_snapshot: None,
             nt_query,
         }
     }
@@ -233,7 +283,7 @@ impl Monitor {
         self.snapshots
     }
 
-    /// Takes a process snapshot and updates the status.
+    /// Looks at the VM and updates the status.
     ///
     /// Returns the status and whether anything visible changed, so the caller
     /// can skip redrawing. The state machine:
@@ -245,10 +295,22 @@ impl Monitor {
     ///   `stats_every` has elapsed since the baseline, or when there is no
     ///   CPU reading yet (so the first number appears one poll after the VM
     ///   showed up rather than a full interval later). A window shorter than
-    ///   one second is too noisy and is skipped.
-    pub fn poll(&mut self, force: bool) -> (Status, bool) {
+    ///   one second is too noisy and is skipped. In between, only the pid is
+    ///   checked.
+    ///
+    /// `relaxed` says nobody is at the machine: then a snapshot is taken at
+    /// most every [`RELAXED_DISCOVERY`] while the VM is off and the numbers
+    /// are refreshed every [`RELAXED_STATS`] while it runs, so an idle
+    /// machine does almost no work for the icon. The pid check is unaffected,
+    /// so a stop is still noticed at the next poll. `force` overrides both.
+    pub fn poll(&mut self, force: bool, relaxed: bool) -> (Status, bool) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_t);
+        let refresh_every = if relaxed {
+            self.stats_every.max(RELAXED_STATS)
+        } else {
+            self.stats_every
+        };
 
         // Fast path: the VM is known and no refresh is due, so a snapshot
         // could only confirm that it still exists. Ask about its pid instead.
@@ -256,11 +318,20 @@ impl Monitor {
         // which finds a restarted VM or reports this one gone.
         if self.cur.running
             && !force
-            && elapsed < self.stats_every
+            && elapsed < refresh_every
             && self.cur.cpu.is_some()
             && self.alive(self.last_pid)
         {
             return (self.cur, false);
+        }
+
+        // Relaxed discovery: the VM is off and nobody would see it appear.
+        if !self.cur.running && !force && relaxed {
+            if let Some(t) = self.last_snapshot {
+                if now.duration_since(t) < RELAXED_DISCOVERY {
+                    return (self.cur, false);
+                }
+            }
         }
 
         let found = self.find();
@@ -295,7 +366,7 @@ impl Monitor {
         // appears quickly instead of after a full interval. (Reached with a
         // refresh not due only if the pid check above failed and the snapshot
         // then found the same pid after all.)
-        if !force && elapsed < self.stats_every && self.cur.cpu.is_some() {
+        if !force && elapsed < refresh_every && self.cur.cpu.is_some() {
             return (self.cur, false);
         }
         if elapsed >= Duration::from_secs(1) {
@@ -362,52 +433,19 @@ impl Monitor {
         eq_lowercase_utf16(base, &self.proc_name)
     }
 
-    /// Takes a snapshot of the session-0 process list (into a buffer
-    /// allocated for the call and sized from the previous one, grown if
-    /// `STATUS_INFO_LENGTH_MISMATCH` says so) and walks the entries. Returns
-    /// `(pid, kernel+user time in 100 ns units, working set bytes)` of the
-    /// first process whose image name matches, case-insensitively.
+    /// Takes a snapshot of the session-0 process list and walks the entries.
+    /// Returns `(pid, kernel+user time in 100 ns units, working set bytes)`
+    /// of the first process whose image name matches, case-insensitively.
     fn find(&mut self) -> Option<(usize, i64, u64)> {
-        let query = self.nt_query?;
-        let mut buf = vec![0u8; self.snapshot_size];
-        loop {
-            let mut needed: u32 = 0;
-            let mut req = SysSessionProcInfo {
-                session_id: VM_SESSION,
-                size_of_buf: buf.len() as u32,
-                buffer: buf.as_mut_ptr().cast(),
-            };
-            let st = unsafe {
-                query(
-                    SYSTEM_SESSION_PROCESS_INFORMATION,
-                    (&mut req as *mut SysSessionProcInfo).cast(),
-                    std::mem::size_of::<SysSessionProcInfo>() as u32,
-                    &mut needed,
-                )
-            };
-            if st == 0 {
-                break;
-            }
-            if st != STATUS_INFO_LENGTH_MISMATCH {
-                return None;
-            }
-            // `needed` is the size that would have fitted; doubling as a floor
-            // guarantees progress even if it were left at zero.
-            let size = (needed as usize + SNAPSHOT_SLACK).max(buf.len() * 2);
-            buf = vec![0; size];
-        }
-        self.snapshot_size = buf.len();
-        self.snapshots += 1;
-
+        let buf = self.snapshot()?;
         let mut off = 0usize;
         loop {
-            if off + std::mem::size_of::<SysProcInfo>() > buf.len() {
+            if off + std::mem::size_of::<SysProcInfo>() > buf.len {
                 return None;
             }
             // SAFETY: the kernel filled buf with a chain of SYSTEM_PROCESS_INFORMATION
             // entries; each entry is at least size_of::<SysProcInfo>() bytes.
-            let p =
-                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const SysProcInfo) };
+            let p = unsafe { std::ptr::read_unaligned(buf.ptr.add(off) as *const SysProcInfo) };
             if !p.image_name.is_null() && p.image_name_length > 0 {
                 let n = p.image_name_length as usize / 2;
                 // SAFETY: image_name points into buf (the kernel stores the string
@@ -426,6 +464,44 @@ impl Monitor {
             }
             off += p.next_entry_offset as usize;
         }
+    }
+
+    /// The session-0 process list in a buffer allocated for the call, sized
+    /// from the previous one and grown if `STATUS_INFO_LENGTH_MISMATCH` says
+    /// so. Also keeps the snapshot bookkeeping.
+    fn snapshot(&mut self) -> Option<Pages> {
+        let query = self.nt_query?;
+        let mut buf = Pages::new(self.snapshot_size)?;
+        loop {
+            let mut needed: u32 = 0;
+            let mut req = SysSessionProcInfo {
+                session_id: VM_SESSION,
+                size_of_buf: buf.len as u32,
+                buffer: buf.ptr.cast(),
+            };
+            let st = unsafe {
+                query(
+                    SYSTEM_SESSION_PROCESS_INFORMATION,
+                    (&mut req as *mut SysSessionProcInfo).cast(),
+                    std::mem::size_of::<SysSessionProcInfo>() as u32,
+                    &mut needed,
+                )
+            };
+            if st == 0 {
+                break;
+            }
+            if st != STATUS_INFO_LENGTH_MISMATCH {
+                return None;
+            }
+            // `needed` is the size that would have fitted; doubling as a floor
+            // guarantees progress even if it were left at zero.
+            let size = (needed as usize + SNAPSHOT_SLACK).max(buf.len * 2);
+            buf = Pages::new(size)?;
+        }
+        self.snapshot_size = buf.len;
+        self.snapshots += 1;
+        self.last_snapshot = Some(Instant::now());
+        Some(buf)
     }
 }
 
@@ -560,14 +636,14 @@ mod tests {
     fn poll_live() {
         for name in ["vmmemWSL", "services.exe"] {
             let mut m = Monitor::new(name, Duration::from_secs(30));
-            let (st, changed) = m.poll(true);
+            let (st, changed) = m.poll(true, false);
             eprintln!("{name}: first poll -> {st:?} changed={changed}");
             if !st.running {
                 continue;
             }
             assert!(st.cpu.is_none(), "CPU must be unknown after baseline");
             std::thread::sleep(Duration::from_millis(1500));
-            let (st, changed) = m.poll(true);
+            let (st, changed) = m.poll(true, false);
             eprintln!("{name}: second poll -> {st:?} changed={changed}");
             assert!(
                 st.cpu.is_some(),
@@ -575,17 +651,39 @@ mod tests {
             );
             assert!(changed);
             let before = m.snapshots();
-            let (_, changed) = m.poll(false);
-            assert!(
-                !changed,
-                "unforced poll within interval should not report a change"
-            );
-            assert_eq!(
-                m.snapshots(),
-                before,
-                "a poll within the interval must not take a snapshot"
-            );
+            for relaxed in [false, true] {
+                let (_, changed) = m.poll(false, relaxed);
+                assert!(
+                    !changed,
+                    "unforced poll within interval should not report a change"
+                );
+                assert_eq!(
+                    m.snapshots(),
+                    before,
+                    "a poll within the interval must not take a snapshot"
+                );
+            }
         }
+    }
+
+    /// While the VM is off, a relaxed poll looks for it at most every
+    /// `RELAXED_DISCOVERY`; a normal or forced poll always does.
+    #[test]
+    fn relaxed_discovery() {
+        let mut m = Monitor::new("no-such-process.exe", Duration::from_secs(30));
+        let (st, _) = m.poll(false, true);
+        assert!(!st.running);
+        assert_eq!(m.snapshots(), 1, "the first poll always looks");
+        m.poll(false, true);
+        assert_eq!(
+            m.snapshots(),
+            1,
+            "relaxed: no second look within the interval"
+        );
+        m.poll(false, false);
+        assert_eq!(m.snapshots(), 2, "someone is there: every poll looks");
+        m.poll(true, true);
+        assert_eq!(m.snapshots(), 3, "forced: always");
     }
 
     /// The pid check behind the fast path: a process that is always there,
@@ -625,7 +723,7 @@ mod tests {
     #[ignore]
     fn poll_cost() {
         let mut m = Monitor::new("vmmemWSL", Duration::from_secs(30));
-        m.poll(true); // warm up: sizes the buffer
+        m.poll(true, false); // warm up: sizes the buffer
         let n = 500;
         let t = Instant::now();
         for _ in 0..n {
@@ -655,6 +753,62 @@ mod tests {
             m.snapshot_size / 1024,
             needed / 1024
         );
+    }
+
+    /// Why a snapshot costs what it does: what it contains, and its cost in
+    /// CPU cycles depending on how long the thread slept before it (after a
+    /// pause the kernel's process and thread structures are no longer in the
+    /// caches). `cargo test --release -- --ignored --nocapture snapshot_cold_cost`.
+    #[test]
+    #[ignore]
+    fn snapshot_cold_cost() {
+        use windows_sys::Win32::Foundation::{BOOL, HANDLE};
+        use windows_sys::Win32::System::Threading::GetCurrentThread;
+        type QueryThreadCycleTimeFn = unsafe extern "system" fn(HANDLE, *mut u64) -> BOOL;
+        let cycle_time: QueryThreadCycleTimeFn = unsafe {
+            let k32 = GetModuleHandleW(wide("kernel32.dll").as_ptr());
+            std::mem::transmute(
+                GetProcAddress(k32, c"QueryThreadCycleTime".as_ptr().cast()).unwrap(),
+            )
+        };
+        let cycles = || {
+            let mut c = 0u64;
+            unsafe { cycle_time(GetCurrentThread(), &mut c) };
+            c
+        };
+
+        let mut m = Monitor::new("vmmemWSL", Duration::from_secs(30));
+        let buf = m.snapshot().unwrap();
+        let (mut procs, mut threads, mut off) = (0usize, 0usize, 0usize);
+        loop {
+            let p = unsafe { std::ptr::read_unaligned(buf.ptr.add(off) as *const SysProcInfo) };
+            procs += 1;
+            threads += p.number_of_threads as usize;
+            if p.next_entry_offset == 0 {
+                break;
+            }
+            off += p.next_entry_offset as usize;
+        }
+        eprintln!(
+            "session 0: {procs} processes, {threads} threads, {} KB buffer",
+            m.snapshot_size / 1024
+        );
+        drop(buf);
+
+        for pause_ms in [0u64, 100, 1000, 5000] {
+            let n = if pause_ms >= 1000 { 4 } else { 10 };
+            let mut total = 0u64;
+            for _ in 0..n {
+                std::thread::sleep(Duration::from_millis(pause_ms));
+                let c0 = cycles();
+                m.find();
+                total += cycles() - c0;
+            }
+            eprintln!(
+                "after a {pause_ms:>4} ms pause: {:.2} million cycles per snapshot",
+                total as f64 / n as f64 / 1e6
+            );
+        }
     }
 
     /// Cost of the pid check done by the polls between two refreshes.
