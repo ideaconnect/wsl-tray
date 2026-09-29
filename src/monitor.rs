@@ -25,6 +25,23 @@
 //! * `SystemProcessIdInformation`, the name behind one pid: a few hundred
 //!   nanoseconds, used to confirm a known VM is still there.
 //!
+//! # Windows 10: `vmmem` is not only WSL
+//!
+//! Windows 11 gives the WSL2 VM a process name of its own, `vmmemWSL`. On
+//! Windows 10 it is `vmmem`, the name of the memory process of every Hyper-V
+//! VM, and a machine can have more than one. One seen in practice was created
+//! at boot, long before WSL started, by a process that exited right after: an
+//! orphan that never goes away, which a plain name match reports as "WSL2
+//! running" forever, at 0 MB. A VM's memory process is created by its worker,
+//! `vmwp.exe`, which lives as long as the VM. So when looking for `vmmem`, only
+//! a process whose parent is still in the list, and not newer than it (pids
+//! are reused), counts; the snapshot already holds both, so this costs no
+//! extra call. Another *live* VM next to WSL2 (Windows Sandbox, a Hyper-V
+//! guest) still cannot be told apart without administrator rights: neither
+//! the worker nor the memory process can be opened, and the Host Compute
+//! Service, which knows which VM is WSL's, is admin-only. The first one is
+//! then taken, as before.
+//!
 //! # What the numbers mean
 //!
 //! * CPU: the increase of the process's kernel+user time between two
@@ -145,6 +162,10 @@ const SYSTEM_PROCESS_ID_INFORMATION: u32 = 88;
 /// Session of the VM process: it is created by the WSL service, which like
 /// every service runs in session 0.
 const VM_SESSION: u32 = 0;
+/// Name of the memory process of every Hyper-V VM on Windows 10, WSL's
+/// included. A process with this name only counts while its parent, the VM
+/// worker, still runs (see the module documentation).
+const SHARED_VM_NAME: &str = "vmmem";
 
 /// `SYSTEM_SESSION_PROCESS_INFORMATION`: the input of a session-restricted
 /// snapshot. `buffer` receives the same chain of entries as
@@ -245,6 +266,82 @@ struct SysProcInfo {
     _pad2: [u8; 4],
     peak_working_set_size: usize,
     working_set_size: usize,
+}
+
+/// The fields of one process-list entry that [`pick`] looks at.
+#[derive(Clone, Copy, Debug)]
+struct Entry<'a> {
+    /// Image name as stored by the kernel; empty for the idle process.
+    name: &'a [u16],
+    pid: usize,
+    /// Pid of the creator (`InheritedFromUniqueProcessId`). It may have
+    /// exited since, and its pid may have been given to another process.
+    parent: usize,
+    /// Creation time, 100 ns units.
+    create_time: i64,
+    /// Kernel+user time, 100 ns units.
+    cpu_time: i64,
+    /// Working set, bytes.
+    working_set: u64,
+}
+
+/// Walks the chain of `SYSTEM_PROCESS_INFORMATION` entries in a snapshot.
+#[derive(Clone)]
+struct Entries<'a> {
+    buf: &'a Pages,
+    /// Offset of the next entry; `None` once the last one was returned.
+    off: Option<usize>,
+}
+
+impl<'a> Iterator for Entries<'a> {
+    type Item = Entry<'a>;
+
+    fn next(&mut self) -> Option<Entry<'a>> {
+        let off = self.off?;
+        if off + std::mem::size_of::<SysProcInfo>() > self.buf.len {
+            self.off = None;
+            return None;
+        }
+        // SAFETY: the kernel filled buf with a chain of SYSTEM_PROCESS_INFORMATION
+        // entries; each entry is at least size_of::<SysProcInfo>() bytes.
+        let p = unsafe { std::ptr::read_unaligned(self.buf.ptr.add(off) as *const SysProcInfo) };
+        self.off = (p.next_entry_offset != 0).then_some(off + p.next_entry_offset as usize);
+        let name: &'a [u16] = if p.image_name.is_null() || p.image_name_length == 0 {
+            &[]
+        } else {
+            // SAFETY: image_name points into buf (the kernel stores the string
+            // after the fixed part of the entry), image_name_length bytes long.
+            unsafe { std::slice::from_raw_parts(p.image_name, p.image_name_length as usize / 2) }
+        };
+        Some(Entry {
+            name,
+            pid: p.unique_process_id,
+            parent: p.inherited_from_unique_process_id,
+            create_time: p.create_time,
+            cpu_time: p.user_time + p.kernel_time,
+            working_set: p.working_set_size as u64,
+        })
+    }
+}
+
+/// The first entry called `name` (already lower-cased), compared
+/// case-insensitively. With `need_parent`, an entry only counts if its parent
+/// is in the same list and was created no later than it: an orphan whose
+/// creator has exited is skipped, and so is one whose parent pid now belongs
+/// to a newer process.
+fn pick<'a, I>(entries: I, name: &str, need_parent: bool) -> Option<Entry<'a>>
+where
+    I: Iterator<Item = Entry<'a>> + Clone,
+{
+    entries
+        .clone()
+        .filter(|e| eq_lowercase_utf16(e.name, name))
+        .find(|vm| {
+            !need_parent
+                || entries
+                    .clone()
+                    .any(|p| p.pid == vm.parent && p.create_time <= vm.create_time)
+        })
 }
 
 impl Monitor {
@@ -433,37 +530,18 @@ impl Monitor {
         eq_lowercase_utf16(base, &self.proc_name)
     }
 
-    /// Takes a snapshot of the session-0 process list and walks the entries.
-    /// Returns `(pid, kernel+user time in 100 ns units, working set bytes)`
-    /// of the first process whose image name matches, case-insensitively.
+    /// Takes a snapshot of the session-0 process list and returns
+    /// `(pid, kernel+user time in 100 ns units, working set bytes)` of the
+    /// first process whose image name matches, case-insensitively; for
+    /// [`SHARED_VM_NAME`], the first whose VM worker still runs.
     fn find(&mut self) -> Option<(usize, i64, u64)> {
         let buf = self.snapshot()?;
-        let mut off = 0usize;
-        loop {
-            if off + std::mem::size_of::<SysProcInfo>() > buf.len {
-                return None;
-            }
-            // SAFETY: the kernel filled buf with a chain of SYSTEM_PROCESS_INFORMATION
-            // entries; each entry is at least size_of::<SysProcInfo>() bytes.
-            let p = unsafe { std::ptr::read_unaligned(buf.ptr.add(off) as *const SysProcInfo) };
-            if !p.image_name.is_null() && p.image_name_length > 0 {
-                let n = p.image_name_length as usize / 2;
-                // SAFETY: image_name points into buf (the kernel stores the string
-                // after the fixed part of the entry), n UTF-16 units long.
-                let name = unsafe { std::slice::from_raw_parts(p.image_name, n) };
-                if eq_lowercase_utf16(name, &self.proc_name) {
-                    return Some((
-                        p.unique_process_id,
-                        p.user_time + p.kernel_time,
-                        p.working_set_size as u64,
-                    ));
-                }
-            }
-            if p.next_entry_offset == 0 {
-                return None;
-            }
-            off += p.next_entry_offset as usize;
-        }
+        let entries = Entries {
+            buf: &buf,
+            off: Some(0),
+        };
+        let vm = pick(entries, &self.proc_name, self.proc_name == SHARED_VM_NAME)?;
+        Some((vm.pid, vm.cpu_time, vm.working_set))
     }
 
     /// The session-0 process list in a buffer allocated for the call, sized
@@ -627,6 +705,48 @@ mod tests {
         assert!(eq_lowercase_utf16(&u16s("ÄBC.exe"), "äbc.exe"));
         assert!(eq_lowercase_utf16(&u16s("ZOË.EXE"), "zoë.exe"));
         assert!(!eq_lowercase_utf16(&u16s("ABC.exe"), "äbc.exe"));
+    }
+
+    fn entry(name: &[u16], pid: usize, parent: usize, create_time: i64) -> Entry<'_> {
+        Entry {
+            name,
+            pid,
+            parent,
+            create_time,
+            cpu_time: 0,
+            working_set: 0,
+        }
+    }
+
+    /// `vmmem` needs a live parent that is not newer than it; without
+    /// `need_parent` (the `vmmemWSL` case) the first name match wins.
+    #[test]
+    fn pick_needs_live_parent() {
+        let u16s = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let (vmmem, vmwp, svc) = (u16s("VmMem"), u16s("vmwp.exe"), u16s("svchost.exe"));
+        let pid = |list: &[Entry], need_parent| {
+            pick(list.iter().copied(), "vmmem", need_parent).map(|e| e.pid)
+        };
+
+        // Orphan: its creator (pid 99) is gone.
+        let orphan = [entry(&svc, 1, 0, 0), entry(&vmmem, 10, 99, 5)];
+        assert_eq!(pid(&orphan, true), None);
+        assert_eq!(pid(&orphan, false), Some(10), "plain name match");
+
+        // The parent pid now belongs to a process started after the VM's.
+        let reused = [entry(&vmwp, 20, 1, 50), entry(&vmmem, 21, 20, 10)];
+        assert_eq!(pid(&reused, true), None);
+
+        // Orphan first, then a VM whose worker runs: the second one.
+        let both = [
+            entry(&vmmem, 10, 99, 5),
+            entry(&vmwp, 30, 1, 100),
+            entry(&vmmem, 31, 30, 101),
+        ];
+        assert_eq!(pid(&both, true), Some(31));
+        assert_eq!(pid(&both, false), Some(10));
+
+        assert_eq!(pid(&[entry(&svc, 1, 0, 0)], true), None, "no match");
     }
 
     /// Exercises the live sampler against whatever is running on this machine.

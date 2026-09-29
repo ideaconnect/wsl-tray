@@ -85,6 +85,9 @@ The Windows 11 and Windows 10 builds differ in one thing only: the name of
 the VM process they look for, `vmmemWSL` or `vmmem`. If the icon stays grey
 while a distribution is running, look the process up in Task Manager
 (Details tab) and take the other build, or pass the name with `-process`.
+On Windows 10 `vmmem` is the memory process of every Hyper-V VM, so a
+`vmmem` only counts while the VM worker that created it still runs; see
+*How it works*.
 
 On Windows 11 the icon shows up next to the clock on first run (the app sets
 its own `IsPromoted` flag in `HKCU\Control Panel\NotifyIconSettings`, but only
@@ -152,6 +155,15 @@ check_cost` prints the snapshot and pid-check costs on your machine.
   presence is the on/off signal. `wsl --list --running` is not used because
   it says "no running distributions" while the VM is still alive and holding
   memory.
+- On Windows 10 the name is not WSL's alone: `vmmem` is the memory process of
+  every Hyper-V VM, and an orphaned one, left behind at boot by a creator
+  that exited at once, would read as "WSL2 running" forever at 0 MB. A VM's
+  memory process is created by its worker, `vmwp.exe`, which lives as long
+  as the VM, so a `vmmem` counts only if its parent is in the same snapshot
+  and not newer than it (pids are reused). This needs no extra call. A second
+  *live* VM next to WSL2 (Windows Sandbox, a Hyper-V guest) still cannot be
+  told apart without administrator rights, and the first one found is taken.
+  `vmmemWSL` on Windows 11 is WSL's only, so there the name is enough.
 - CPU and memory come from `NtQuerySystemInformation`, the call Task Manager
   uses. It needs no handle to the process, which matters because `vmmemWSL`
   runs as SYSTEM and `OpenProcess` on it is denied to a normal user with any
